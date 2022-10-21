@@ -559,8 +559,7 @@ STATIC_DOC = "/static/docs/index.html"
 
 HOSTNAME = socket.gethostname()
 
-CACHE_MIXIN_SECONDS = 60
-
+CACHE_CONTROL_DIRECTIVES = {"max_age": 60}
 TAGGIT_CASE_INSENSITIVE = True
 
 DEFAULT_CELERY_MAX_RETIRES = 3
@@ -611,6 +610,7 @@ GOOGLE_FLOW = {
         "javascript_origins": [],
     }
 }
+GOOGLE_FLOW_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 CSP_CONNECT_SRC = ["https://maps.googleapis.com", "http://localhost:8000"]
 CSP_FONT_SRC = [
     "http://netdna.bootstrapcdn.com",

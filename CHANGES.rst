@@ -3,6 +3,23 @@ Changelog for Onadata
 
 ``* represents releases that introduce new migrations``
 
+v3.6.1(2022-11-10)
+------------------
+- Retry post submission processing tasks if submission is not found
+  `PR #2333 <https://github.com/onaio/onadata/pull/2333>`_
+
+v3.6.0(2022-10-31)
+------------------
+- Update dependencies & update flaky tests
+  `PR #2327 <https://github.com/onaio/onadata/pull/2327>`_
+  [@DavisRayM]
+- Refresh google credentials once expired/invalid
+  `PR #2326 <https://github.com/onaio/onadata/pull/2326>`_
+  [@FrankApiyo]
+- Update github action workflows
+  `PR #2325 <https://github.com/onaio/onadata/pull/2325>`_
+  [@DavisRayM]
+
 v3.5.0(2022-10-06)
 ------------------
 - Fix org members permissions 

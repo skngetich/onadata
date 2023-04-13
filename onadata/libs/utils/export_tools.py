@@ -135,7 +135,7 @@ def generate_export(export_type, xform, export_id=None, options=None):  # noqa C
     start = options.get("start")
 
     export_type_func_map = {
-        Export.XLS_EXPORT: "to_xls_export",
+        Export.XLSX_EXPORT: "to_xlsx_export",
         Export.CSV_EXPORT: "to_flat_csv_export",
         Export.CSV_ZIP_EXPORT: "to_zipped_csv",
         Export.SAV_ZIP_EXPORT: "to_zipped_sav",
@@ -172,7 +172,7 @@ def generate_export(export_type, xform, export_id=None, options=None):  # noqa C
 
     export_builder = ExportBuilder()
     export_builder.TRUNCATE_GROUP_TITLE = (  # noqa
-        True if export_type == Export.SAV_ZIP_EXPORT else remove_group_name
+        False if export_type == Export.SAV_ZIP_EXPORT else remove_group_name
     )
     export_builder.GROUP_DELIMITER = options.get(  # noqa
         "group_delimiter", DEFAULT_GROUP_DELIMITER
@@ -592,7 +592,10 @@ def generate_geojson_export(
     }
     _context = {}
     _context["request"] = request
-    content = GeoJsonSerializer(xform.instances.all(), many=True, context=_context)
+    # filter out deleted submissions
+    content = GeoJsonSerializer(
+        xform.instances.filter(deleted_at__isnull=True), many=True, context=_context
+    )
     data_to_write = json.dumps(content.data).encode("utf-8")
     timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
     basename = f"{id_string}_{timestamp}"

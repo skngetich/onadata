@@ -14,11 +14,11 @@ from collections import OrderedDict
 from ctypes import ArgumentError
 from io import BytesIO
 
-from openpyxl import load_workbook
 from django.conf import settings
 from django.core.files.temp import NamedTemporaryFile
-from pyxform.builder import create_survey_from_xls
 
+from openpyxl import load_workbook
+from pyxform.builder import create_survey_from_xls
 from savReaderWriter import SavHeaderReader, SavReader
 
 from onadata.apps.logger.import_tools import django_file
@@ -26,18 +26,18 @@ from onadata.apps.main.tests.test_base import TestBase
 from onadata.apps.viewer.models.data_dictionary import DataDictionary
 from onadata.apps.viewer.models.parsed_instance import _encode_for_mongo, query_data
 from onadata.apps.viewer.tests.export_helpers import viewer_fixture_path
-from onadata.libs.utils.csv_builder import CSVDataFrameBuilder, get_labels_from_columns
 from onadata.libs.utils.common_tags import (
-    SELECT_BIND_TYPE,
     MULTIPLE_SELECT_TYPE,
     REVIEW_COMMENT,
     REVIEW_DATE,
     REVIEW_STATUS,
+    SELECT_BIND_TYPE,
 )
+from onadata.libs.utils.csv_builder import CSVDataFrameBuilder, get_labels_from_columns
 from onadata.libs.utils.export_builder import (
+    ExportBuilder,
     decode_mongo_encoded_section_names,
     dict_to_joined_export,
-    ExportBuilder,
     string_to_date_with_xls_validation,
 )
 from onadata.libs.utils.export_tools import get_columns_with_hxl
@@ -448,7 +448,7 @@ class TestExportBuilder(TestBase):
 
         shutil.rmtree(temp_dir)
 
-    def test_xls_export_with_osm_data(self):
+    def test_xlsx_export_with_osm_data(self):
         """
         Tests that osm data is included in xls export
         """
@@ -457,7 +457,7 @@ class TestExportBuilder(TestBase):
         export_builder = ExportBuilder()
         export_builder.set_survey(survey, xform)
         with NamedTemporaryFile(suffix=".xlsx") as temp_xls_file:
-            export_builder.to_xls_export(temp_xls_file.name, self.osm_data)
+            export_builder.to_xlsx_export(temp_xls_file.name, self.osm_data)
             temp_xls_file.seek(0)
             workbook = load_workbook(temp_xls_file.name)
             osm_data_sheet = workbook["osm"]
@@ -908,6 +908,87 @@ class TestExportBuilder(TestBase):
         ]
         self.assertEqual(choices, expected_choices)
 
+    def test_sav_export_with_gps_and_group(self):
+        """
+        Test that SAV exports work when a GPS Question is both in a group
+        and outside of one
+        """
+        md = """
+        | survey |
+        |        | type              | name    | label |
+        |        | begin group       | group_a | A     |
+        |        | gps               | gps     | GPS   |
+        |        | end_group         | group_a | A     |
+        |        | gps               | gps     | GPS B |
+        """
+        survey = self.md_to_pyxform_survey(md, {"name": "gps_test"})
+        data = [{"group_a/gps": "4.0 36.1 5000 20", "gps": "1.0 36.1 2000 20", "_submission_time": "2016-11-21T03:42:43.00-08:00"}]
+        export_builder = ExportBuilder()
+        export_builder.TRUNCATE_GROUP_TITLE = False
+        export_builder.set_survey(survey)
+        with NamedTemporaryFile(suffix=".zip") as temp_zip_file:
+            export_builder.to_zipped_sav(temp_zip_file.name, data)
+            temp_zip_file.seek(0)
+            temp_dir = tempfile.mkdtemp()
+            with zipfile.ZipFile(temp_zip_file.name, "r") as zip_file:
+                zip_file.extractall(temp_dir)
+
+        expected_data = [
+                [
+                    b'group_a.gps',
+                    b'@group_a._gps_latitude',
+                    b'@group_a._gps_longitude',
+                    b'@group_a._gps_altitude',
+                    b'@group_a._gps_precision',
+                    b'gps',
+                    b'@_gps_latitude',
+                    b'@_gps_longitude',
+                    b'@_gps_altitude',
+                    b'@_gps_precision',
+                    b'meta.instanceID',
+                    b'@_id',
+                    b'@_uuid',
+                    b'@_submission_time',
+                    b'@_index',
+                    b'@_parent_table_name',
+                    b'@_parent_index',
+                    b'@_tags',
+                    b'@_notes',
+                    b'@_version',
+                    b'@_duration',
+                    b'@_submitted_by'
+                ],
+                [
+                    b'4.0 36.1 5000 20',
+                    4.0,
+                    36.1,
+                    5000.0,
+                    20.0,
+                    b'1.0 36.1 2000 20',
+                    1.0,
+                    36.1,
+                    2000.0,
+                    20.0,
+                    b'',
+                    None,
+                    b'',
+                    b'2016-11-21 03:42:43',
+                    1.0,
+                    b'',
+                    -1.0,
+                    b'',
+                    b'',
+                    b'',
+                    b'',
+                    b''
+                ]
+        ]
+        with SavReader(os.path.join(temp_dir, "gps_test.sav"), returnHeader=True) as reader:
+            rows = list(reader)
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(expected_data, rows)
+        shutil.rmtree(temp_dir)
+
     # pylint: disable=invalid-name
     def test_zipped_sav_export_with_numeric_select_multiple_field(self):
         md = """
@@ -1170,7 +1251,7 @@ class TestExportBuilder(TestBase):
             self.assertIn(b"sport", [x[0:5] for x in rows[0]])
 
     # pylint: disable=invalid-name
-    def test_xls_export_works_with_unicode(self):
+    def test_xlsx_export_works_with_unicode(self):
         survey = create_survey_from_xls(
             _logger_fixture_path("childrens_survey_unicode.xlsx"),
             default_name="childrenss_survey_unicode",
@@ -1178,7 +1259,7 @@ class TestExportBuilder(TestBase):
         export_builder = ExportBuilder()
         export_builder.set_survey(survey)
         with NamedTemporaryFile(suffix=".xlsx") as temp_xls_file:
-            export_builder.to_xls_export(temp_xls_file.name, self.data_utf8)
+            export_builder.to_xlsx_export(temp_xls_file.name, self.data_utf8)
             temp_xls_file.seek(0)
             # check that values for red\'s and blue\'s are set to true
             workbook = load_workbook(temp_xls_file.name)
@@ -1189,7 +1270,7 @@ class TestExportBuilder(TestBase):
             self.assertFalse(data["children.info/fav_colors/pink's"])
 
     # pylint: disable=invalid-name
-    def test_xls_export_with_hxl_adds_extra_row(self):
+    def test_xlsx_export_with_hxl_adds_extra_row(self):
         # hxl_example.xlsx contains `instance::hxl` column whose value is #age
         xlsform_path = os.path.join(
             settings.PROJECT_ROOT,
@@ -1218,7 +1299,7 @@ class TestExportBuilder(TestBase):
             survey_elements
         )
 
-        export_builder.to_xls_export(
+        export_builder.to_xlsx_export(
             temp_xls_file.name, self.data_utf8, columns_with_hxl=columns_with_hxl
         )
         temp_xls_file.seek(0)
@@ -1271,7 +1352,7 @@ class TestExportBuilder(TestBase):
         export_builder = ExportBuilder()
         export_builder.set_survey(survey)
         with NamedTemporaryFile(suffix=".xlsx") as temp_xls_file:
-            export_builder.to_xls_export(temp_xls_file, xdata)
+            export_builder.to_xlsx_export(temp_xls_file, xdata)
             temp_xls_file.seek(0)
             workbook = load_workbook(temp_xls_file)
             children_sheet = workbook["exp"]
@@ -1595,13 +1676,13 @@ class TestExportBuilder(TestBase):
         ][0]
         self.assertEqual(expected_section["elements"][0]["title"], match["title"])
 
-    def test_to_xls_export_works(self):
+    def test_to_xlsx_export_works(self):
         survey = self._create_childrens_survey()
         export_builder = ExportBuilder()
         export_builder.set_survey(survey)
         with NamedTemporaryFile(suffix=".xlsx") as xls_file:
             filename = xls_file.name
-            export_builder.to_xls_export(filename, self.data)
+            export_builder.to_xlsx_export(filename, self.data)
             xls_file.seek(0)
             workbook = load_workbook(filename)
             # check that we have childrens_survey, children, children_cartoons
@@ -1718,14 +1799,14 @@ class TestExportBuilder(TestBase):
             )
 
     # pylint: disable=invalid-name
-    def test_to_xls_export_respects_custom_field_delimiter(self):
+    def test_to_xlsx_export_respects_custom_field_delimiter(self):
         survey = self._create_childrens_survey()
         export_builder = ExportBuilder()
         export_builder.GROUP_DELIMITER = ExportBuilder.GROUP_DELIMITER_DOT
         export_builder.set_survey(survey)
         with NamedTemporaryFile(suffix=".xlsx") as xls_file:
             filename = xls_file.name
-            export_builder.to_xls_export(filename, self.data)
+            export_builder.to_xlsx_export(filename, self.data)
             xls_file.seek(0)
             workbook = load_workbook(filename)
 
@@ -1789,7 +1870,7 @@ class TestExportBuilder(TestBase):
         self.assertEqual(generated_sheet_name, expected_sheet_name)
 
     # pylint: disable=invalid-name
-    def test_to_xls_export_generates_valid_sheet_names(self):
+    def test_to_xlsx_export_generates_valid_sheet_names(self):
         survey = create_survey_from_xls(
             _logger_fixture_path("childrens_survey_with_a_very_long_name.xlsx"),
             default_name="childrens_survey_with_a_very_long_name",
@@ -1798,7 +1879,7 @@ class TestExportBuilder(TestBase):
         export_builder.set_survey(survey)
         with NamedTemporaryFile(suffix=".xlsx") as xls_file:
             filename = xls_file.name
-            export_builder.to_xls_export(filename, self.data)
+            export_builder.to_xlsx_export(filename, self.data)
             xls_file.seek(0)
             workbook = load_workbook(filename)
             # check that we have childrens_survey, children, children_cartoons
@@ -1821,7 +1902,7 @@ class TestExportBuilder(TestBase):
         export_builder.set_survey(survey)
         with NamedTemporaryFile(suffix=".xlsx") as xls_file:
             filename = xls_file.name
-            export_builder.to_xls_export(filename, self.long_survey_data)
+            export_builder.to_xlsx_export(filename, self.long_survey_data)
             xls_file.seek(0)
             workbook = load_workbook(filename)
 
@@ -1919,7 +2000,7 @@ class TestExportBuilder(TestBase):
         ]
         # create export file
         with NamedTemporaryFile(suffix=".xlsx") as temp_xls_file:
-            export_builder.to_xls_export(temp_xls_file.name, data)
+            export_builder.to_xlsx_export(temp_xls_file.name, data)
         # this should error if there is a problem, not sure what to assert
 
     def test_convert_types(self):
@@ -2074,7 +2155,7 @@ class TestExportBuilder(TestBase):
         self.assertEqual(field_name, expected_field_name)
 
     # pylint: disable=invalid-name
-    def test_xls_export_remove_group_name(self):
+    def test_xlsx_export_remove_group_name(self):
         survey = create_survey_from_xls(
             _logger_fixture_path("childrens_survey_unicode.xlsx"),
             default_name="childrens_survey_unicode",
@@ -2083,7 +2164,7 @@ class TestExportBuilder(TestBase):
         export_builder.TRUNCATE_GROUP_TITLE = True
         export_builder.set_survey(survey)
         with NamedTemporaryFile(suffix=".xlsx") as temp_xls_file:
-            export_builder.to_xls_export(temp_xls_file.name, self.data_utf8)
+            export_builder.to_xlsx_export(temp_xls_file.name, self.data_utf8)
             temp_xls_file.seek(0)
             # check that values for red\'s and blue\'s are set to true
             workbook = load_workbook(temp_xls_file.name)
@@ -2092,6 +2173,96 @@ class TestExportBuilder(TestBase):
             self.assertTrue(data["fav_colors/red's"])
             self.assertTrue(data["fav_colors/blue's"])
             self.assertFalse(data["fav_colors/pink's"])
+
+    # pylint: disable=invalid-name
+    def test_gps_xlsx_export_remove_group_name(self):
+        self._publish_xls_file_and_set_xform(_logger_fixture_path("gps_data.xlsx"))
+        export_builder = ExportBuilder()
+        export_builder.TRUNCATE_GROUP_TITLE = True
+        export_builder.set_survey(self.xform.survey, self.xform)
+        self.assertEqual(self.xform.instances.count(), 0)
+        self._make_submission(_logger_fixture_path("gps_data.xml"))
+        self.assertEqual(self.xform.instances.count(), 1)
+        records = self.xform.instances.all()
+        inst_json = records.first().json
+        with NamedTemporaryFile(suffix=".xlsx") as temp_xls_file:
+            export_builder.to_xlsx_export(temp_xls_file.name, [inst_json])
+            temp_xls_file.seek(0)
+            workbook = load_workbook(temp_xls_file.name)
+            gps_sheet = workbook["data"]
+            expected_headers = [
+                'start',
+                'end',
+                'test',
+                'Age',
+                'Image',
+                'Select_one_gender',
+                'respondent_name',
+                '_1_2_Where_do_you_live',
+                '_1_3_Another_test',
+                'GPS',
+                '_GPS_latitude',
+                '_GPS_longitude',
+                '_GPS_altitude',
+                '_GPS_precision',
+                'Another_GPS',
+                '_Another_GPS_latitude',
+                '_Another_GPS_longitude',
+                '_Another_GPS_altitude',
+                '_Another_GPS_precision',
+                '__version__',
+                'instanceID',
+                '_id',
+                '_uuid',
+                '_submission_time',
+                '_index',
+                '_parent_table_name',
+                '_parent_index',
+                '_tags',
+                '_notes',
+                '_version',
+                '_duration',
+                '_submitted_by'
+            ]
+            self.assertEqual(expected_headers, list(tuple(gps_sheet.values)[0]))
+            # test exported data
+            expected_data = [
+                '2023-01-20T12:11:29.278+03:00',
+                '2023-01-20T12:12:00.443+03:00',
+                '2',
+                32,
+                None,
+                'male',
+                'dsa',
+                'zcxsd',
+                None,
+                '-1.248238 36.685681 0 0',
+                -1.248238,
+                36.685681,
+                0,
+                0,
+                "-1.244172 36.685359 0 0",
+                -1.244172,
+                36.685359,
+                0,
+                0,
+                'vTEmiygu2uLZpPHBYX8jKj',
+                'uuid:76887abc-7bc4-4f9c-ba64-197968359d36',
+                inst_json.get("_id"),
+                '76887abc-7bc4-4f9c-ba64-197968359d36',
+                1,
+                None,
+                -1,
+                None,
+                None,
+                'vTEmiygu2uLZpPHBYX8jKj',
+                31,
+                'bob'
+            ]
+            actual_data = list(tuple(gps_sheet.values)[1])
+            # remove submission time
+            del actual_data[23]
+            self.assertEqual(expected_data, actual_data)
 
     def test_zipped_csv_export_remove_group_name(self):
         """
@@ -2150,7 +2321,7 @@ class TestExportBuilder(TestBase):
             # check that red and blue are set to true
         shutil.rmtree(temp_dir)
 
-    def test_xls_export_with_labels(self):
+    def test_xlsx_export_with_labels(self):
         survey = create_survey_from_xls(
             _logger_fixture_path("childrens_survey_unicode.xlsx"),
             default_name="childrens_survey_unicode",
@@ -2160,7 +2331,7 @@ class TestExportBuilder(TestBase):
         export_builder.INCLUDE_LABELS = True
         export_builder.set_survey(survey)
         with NamedTemporaryFile(suffix=".xlsx") as temp_xls_file:
-            export_builder.to_xls_export(temp_xls_file.name, self.data_utf8)
+            export_builder.to_xlsx_export(temp_xls_file.name, self.data_utf8)
             temp_xls_file.seek(0)
             # check that values for red\'s and blue\'s are set to true
             workbook = load_workbook(temp_xls_file.name)
@@ -2180,7 +2351,7 @@ class TestExportBuilder(TestBase):
             self.assertFalse(data["fav_colors/pink's"])
 
     # pylint: disable=invalid-name
-    def test_xls_export_with_labels_only(self):
+    def test_xlsx_export_with_labels_only(self):
         survey = create_survey_from_xls(
             _logger_fixture_path("childrens_survey_unicode.xlsx"),
             default_name="childrens_survey_unicode",
@@ -2190,7 +2361,7 @@ class TestExportBuilder(TestBase):
         export_builder.INCLUDE_LABELS_ONLY = True
         export_builder.set_survey(survey)
         temp_xls_file = NamedTemporaryFile(suffix=".xlsx")
-        export_builder.to_xls_export(temp_xls_file.name, self.data_utf8)
+        export_builder.to_xlsx_export(temp_xls_file.name, self.data_utf8)
         temp_xls_file.seek(0)
         # check that values for red\'s and blue\'s are set to true
         wb = load_workbook(temp_xls_file.name)
@@ -2424,7 +2595,7 @@ class TestExportBuilder(TestBase):
             _test_sav_file(section_name)
 
     # pylint: disable=invalid-name
-    def test_xls_export_with_english_labels(self):
+    def test_xlsx_export_with_english_labels(self):
         survey = create_survey_from_xls(
             _logger_fixture_path("childrens_survey_en.xlsx"),
             default_name="childrens_survey_en",
@@ -2436,7 +2607,7 @@ class TestExportBuilder(TestBase):
         export_builder.INCLUDE_LABELS = True
         export_builder.set_survey(survey)
         with NamedTemporaryFile(suffix=".xlsx") as temp_xls_file:
-            export_builder.to_xls_export(temp_xls_file.name, self.data)
+            export_builder.to_xlsx_export(temp_xls_file.name, self.data)
             temp_xls_file.seek(0)
             workbook = load_workbook(temp_xls_file.name)
             childrens_survey_sheet = workbook["childrens_survey_en"]
@@ -2450,7 +2621,7 @@ class TestExportBuilder(TestBase):
             self.assertEqual(labels["fav_colors/blue"], "fav_colors/Blue")
 
     # pylint: disable=invalid-name
-    def test_xls_export_with_swahili_labels(self):
+    def test_xlsx_export_with_swahili_labels(self):
         survey = create_survey_from_xls(
             _logger_fixture_path("childrens_survey_sw.xlsx"),
             default_name="childrens_survey_sw",
@@ -2462,7 +2633,7 @@ class TestExportBuilder(TestBase):
         export_builder.INCLUDE_LABELS = True
         export_builder.set_survey(survey)
         with NamedTemporaryFile(suffix=".xlsx") as temp_xls_file:
-            export_builder.to_xls_export(temp_xls_file.name, self.data)
+            export_builder.to_xlsx_export(temp_xls_file.name, self.data)
             temp_xls_file.seek(0)
             workbook = load_workbook(temp_xls_file.name)
             childrens_survey_sheet = workbook["childrens_survey_sw"]
@@ -2713,7 +2884,7 @@ class TestExportBuilder(TestBase):
         shutil.rmtree(temp_dir)
 
     # pylint: disable=invalid-name
-    def test_xls_export_has_submission_review_fields(self):
+    def test_xlsx_export_has_submission_review_fields(self):
         """
         Test that review comment, status and date fields are in xls exports
         """
@@ -2724,7 +2895,7 @@ class TestExportBuilder(TestBase):
         export_builder.INCLUDE_REVIEW = True
         export_builder.set_survey(survey, xform, include_reviews=True)
         with NamedTemporaryFile(suffix=".xlsx") as temp_xls_file:
-            export_builder.to_xls_export(temp_xls_file.name, self.osm_data)
+            export_builder.to_xlsx_export(temp_xls_file.name, self.osm_data)
             temp_xls_file.seek(0)
             workbook = load_workbook(temp_xls_file.name)
             osm_data_sheet = workbook["osm"]
@@ -2959,7 +3130,7 @@ class TestExportBuilder(TestBase):
         export_builder.set_survey(survey)
         temp_xls_file = NamedTemporaryFile(suffix=".xlsx")
         data = [{"name": "Maria", "age": 25, "fruit": "1"}]  # yapf: disable
-        export_builder.to_xls_export(temp_xls_file, data)
+        export_builder.to_xlsx_export(temp_xls_file, data)
         temp_xls_file.seek(0)
         children_sheet = load_workbook(temp_xls_file)["data"]
         self.assertTrue(children_sheet)
@@ -2993,7 +3164,7 @@ class TestExportBuilder(TestBase):
         export_builder.set_survey(survey)
         temp_xls_file = NamedTemporaryFile(suffix=".xlsx")
         data = [{"name": "Maria", "age": 25, "fruit": "1"}]  # yapf: disable
-        export_builder.to_xls_export(temp_xls_file, data)
+        export_builder.to_xlsx_export(temp_xls_file, data)
         temp_xls_file.seek(0)
         children_sheet = load_workbook(temp_xls_file)["data"]
         self.assertTrue(children_sheet)
@@ -3027,7 +3198,7 @@ class TestExportBuilder(TestBase):
         export_builder.set_survey(survey)
         temp_xls_file = NamedTemporaryFile(suffix=".xlsx")
         data = [{"name": "Maria", "age": 25, "fruit": "1 2"}]  # yapf: disable
-        export_builder.to_xls_export(temp_xls_file, data)
+        export_builder.to_xlsx_export(temp_xls_file, data)
         temp_xls_file.seek(0)
         children_sheet = load_workbook(temp_xls_file)["data"]
         self.assertTrue(children_sheet)
@@ -3062,7 +3233,7 @@ class TestExportBuilder(TestBase):
         export_builder.set_survey(survey)
         temp_xls_file = NamedTemporaryFile(suffix=".xlsx")
         data = [{"name": "Maria", "age": 25, "fruit": "1 2"}]  # yapf: disable
-        export_builder.to_xls_export(temp_xls_file, data)
+        export_builder.to_xlsx_export(temp_xls_file, data)
         temp_xls_file.seek(0)
         children_sheet = load_workbook(temp_xls_file)["data"]
         self.assertTrue(children_sheet)
@@ -3098,7 +3269,7 @@ class TestExportBuilder(TestBase):
         export_builder.set_survey(survey)
         temp_xls_file = NamedTemporaryFile(suffix=".xlsx")
         data = [{"name": "Maria", "age": 25, "fruit": "1 2"}]  # yapf: disable
-        export_builder.to_xls_export(temp_xls_file, data)
+        export_builder.to_xlsx_export(temp_xls_file, data)
         temp_xls_file.seek(0)
         children_sheet = load_workbook(temp_xls_file)["data"]
         self.assertTrue(children_sheet)
@@ -3138,7 +3309,7 @@ class TestExportBuilder(TestBase):
         export_builder.set_survey(survey)
         temp_xls_file = NamedTemporaryFile(suffix=".xlsx")
         data = [{"name": "Maria", "age": 25, "fruit": "1 3"}]  # yapf: disable
-        export_builder.to_xls_export(temp_xls_file, data)
+        export_builder.to_xlsx_export(temp_xls_file, data)
         temp_xls_file.seek(0)
         children_sheet = load_workbook(temp_xls_file)["data"]
         self.assertTrue(children_sheet)
@@ -3174,7 +3345,7 @@ class TestExportBuilder(TestBase):
         export_builder.set_survey(survey)
         temp_xls_file = NamedTemporaryFile(suffix=".xlsx")
         data = [{"name": "Maria", "age": 25, "fruit": "1 3"}]  # yapf: disable
-        export_builder.to_xls_export(temp_xls_file, data)
+        export_builder.to_xlsx_export(temp_xls_file, data)
         temp_xls_file.seek(0)
         children_sheet = load_workbook(temp_xls_file)["data"]
         self.assertTrue(children_sheet)
@@ -3215,7 +3386,7 @@ class TestExportBuilder(TestBase):
         export_builder.set_survey(survey)
         temp_xls_file = NamedTemporaryFile(suffix=".xlsx")
         data = [{"name": "Maria", "age": 25, "fruit": "1 3"}]  # yapf: disable
-        export_builder.to_xls_export(temp_xls_file, data)
+        export_builder.to_xlsx_export(temp_xls_file, data)
         temp_xls_file.seek(0)
         children_sheet = load_workbook(temp_xls_file)["data"]
         self.assertTrue(children_sheet)
@@ -3256,7 +3427,7 @@ class TestExportBuilder(TestBase):
         export_builder.set_survey(survey)
         temp_xls_file = NamedTemporaryFile(suffix=".xlsx")
         data = [{"name": "Maria", "age": 25, "fruit": "1 3"}]  # yapf: disable
-        export_builder.to_xls_export(temp_xls_file, data)
+        export_builder.to_xlsx_export(temp_xls_file, data)
         temp_xls_file.seek(0)
         children_sheet = load_workbook(temp_xls_file)["data"]
         self.assertTrue(children_sheet)
@@ -3307,7 +3478,7 @@ class TestExportBuilder(TestBase):
         temp_xls_file = NamedTemporaryFile(suffix=".xlsx")
 
         data = [{"banks_deal": "1 2 3 4", "primary_bank": "3"}]  # yapf: disable
-        export_builder.to_xls_export(temp_xls_file, data)
+        export_builder.to_xlsx_export(temp_xls_file, data)
         temp_xls_file.seek(0)
         children_sheet = load_workbook(temp_xls_file)["data"]
         self.assertTrue(children_sheet)
@@ -3319,3 +3490,107 @@ class TestExportBuilder(TestBase):
         ]
         temp_xls_file.close()
         self.assertEqual(result, expected_result)
+
+    def test_no_group_name_gps_data(self):
+        """
+        Test that GPS Data is correctly exported when GPS Fields are within
+        groups and the group name is removed
+        """
+        self._publish_xls_file_and_set_xform(_logger_fixture_path("gps_data.xlsx"))
+        export_builder = ExportBuilder()
+        export_builder.TRUNCATE_GROUP_TITLE = True
+        export_builder.set_survey(self.xform.survey, self.xform)
+
+        # Submit test record
+        self._make_submission(_logger_fixture_path("gps_data.xml"))
+        self.assertEqual(self.xform.instances.count(), 1)
+        csv_export = NamedTemporaryFile(suffix=".csv")
+        records = self.xform.instances.all()
+        inst_json = records.first().json
+        export_builder.to_flat_csv_export(
+            csv_export.name,
+            records,
+            self.xform.user.username,
+            self.xform.id_string,
+            "",
+            xform=self.xform,
+            options={},
+        )
+        expected_data = [
+            [
+                "start",
+                "end",
+                "test",
+                "Age",
+                "Image",
+                "Select_one_gender",
+                "respondent_name",
+                "_1_2_Where_do_you_live",
+                "_1_3_Another_test",
+                "GPS",
+                "_GPS_latitude",
+                "_GPS_longitude",
+                "_GPS_altitude",
+                "_GPS_precision",
+                "Another_GPS",
+                "_Another_GPS_latitude",
+                "_Another_GPS_longitude",
+                "_Another_GPS_altitude",
+                "_Another_GPS_precision",
+                "__version__",
+                "instanceID",
+                "_id",
+                "_uuid",
+                "_submission_time",
+                "_date_modified",
+                "_tags",
+                "_notes",
+                "_version",
+                "_duration",
+                "_submitted_by",
+                "_total_media",
+                "_media_count",
+                "_media_all_received",
+            ],
+            [
+                "2023-01-20T12:11:29.278+03:00",
+                "2023-01-20T12:12:00.443+03:00",
+                "2",
+                "32",
+                "n/a",
+                "male",
+                "dsa",
+                "zcxsd",
+                "n/a",
+                "-1.248238 36.685681 0 0",
+                "-1.248238",
+                "36.685681",
+                "0",
+                "0",
+                "-1.244172 36.685359 0 0",
+                "-1.244172",
+                "36.685359",
+                "0",
+                "0",
+                inst_json.get("_version"),
+                "uuid:" + inst_json.get("_uuid"),
+                str(inst_json.get("_id")),
+                inst_json.get("_uuid"),
+                inst_json.get("_submission_time"),
+                inst_json.get("_date_modified"),
+                "",
+                "",
+                "vTEmiygu2uLZpPHBYX8jKj",
+                "31.0",
+                "bob",
+                "0",
+                "0",
+                "True",
+            ],
+        ]
+        csv_file = open(csv_export.name)
+        csvreader = csv.reader(csv_file)
+        for idx, row in enumerate(csvreader):
+            self.assertEqual(row, expected_data[idx])
+
+        csv_export.close()

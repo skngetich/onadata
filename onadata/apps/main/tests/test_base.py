@@ -132,9 +132,9 @@ class TestBase(PyxformMarkdown, TransactionTestCase):
         # make sure publishing the survey worked
         self.assertEqual(XForm.objects.count(), pre_count + 1)
 
-    def _publish_xlsx_file_with_external_choices(self):
+    def _publish_xlsx_file_with_external_choices(self, form_version="v1"):
         path = os.path.join(
-            self.this_directory, "fixtures", "external_choice_form_v1.xlsx"
+            self.this_directory, "fixtures", f"external_choice_form_{form_version}.xlsx"
         )
         pre_count = XForm.objects.count()
         TestBase._publish_xls_file(self, path)
@@ -360,8 +360,8 @@ class TestBase(PyxformMarkdown, TransactionTestCase):
 
     def _set_auth_headers(self, username, password):
         return {
-            "HTTP_AUTHORIZATION": "Basic "
-            + base64.b64encode(f"{username}:{password}".encode("utf-8")).decode(
+            "HTTP_AUTHORIZATION": "Basic " +
+            base64.b64encode(f"{username}:{password}".encode("utf-8")).decode(
                 "utf-8"
             ),
         }
@@ -393,7 +393,7 @@ class TestBase(PyxformMarkdown, TransactionTestCase):
         client.set_authorization("bob", "bob", "Digest")
         return client
 
-    def _publish_submit_geojson(self, has_empty_geoms=False):
+    def _publish_submit_geojson(self, has_empty_geoms=False, only_geopoints=False):
         path = os.path.join(
             settings.PROJECT_ROOT,
             "apps",
@@ -401,7 +401,8 @@ class TestBase(PyxformMarkdown, TransactionTestCase):
             "tests",
             "fixtures",
             "geolocation",
-            "GeoLocationForm.xlsx",
+            ("GeoLocationFormNoPolylineOrPolygon.xlsx"
+             if only_geopoints else "GeoLocationForm.xlsx"),
         )
 
         self._publish_xls_file_and_set_xform(path)

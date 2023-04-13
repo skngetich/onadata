@@ -21,6 +21,7 @@ import openpyxl
 import pytz
 import requests
 from django_digest.test import Client as DigestClient
+from flaky import flaky
 from mock import patch
 from six import iteritems
 
@@ -36,10 +37,12 @@ from onadata.libs.utils.common_tools import get_response_content
 uuid_regex = re.compile(r'(</instance>.*uuid[^//]+="\')([^\']+)(\'".*)', re.DOTALL)
 
 
+@flaky()
 class TestProcess(TestBase, SerializeMixin):
     """
     Test form publishing processes.
     """
+
     lockfile = __file__
 
     loop_str = "loop_over_transport_types_frequency"
@@ -106,6 +109,12 @@ class TestProcess(TestBase, SerializeMixin):
         """Test publishing an XLSX file with external choices"""
         self._publish_xlsx_file_with_external_choices()
 
+    def test_public_xlsx_file_with_external_choices_with_empty_row(self):
+        """
+        Test that a form with empty spaces in list_name column is uploaded correctly
+        """
+        self._publish_xlsx_file_with_external_choices(form_version="v3")
+
     @patch("onadata.apps.main.forms.requests")
     def test_google_url_upload(self, mock_requests):
         """Test uploading an XLSForm from a Google Docs SpreadSheet URL."""
@@ -153,6 +162,7 @@ class TestProcess(TestBase, SerializeMixin):
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(XForm.objects.count(), pre_count + 1)
 
+    @flaky(max_runs=3, min_passes=2)
     @patch("onadata.apps.main.forms.requests")
     def test_url_upload(self, mock_requests):
         """Test uploading an XLSForm from a URL."""
@@ -544,19 +554,19 @@ class TestProcess(TestBase, SerializeMixin):
                     this_list.append(("transport/" + k, v))
             self.assertEqual(test_dict, dict(this_list))
 
-    def test_xls_export_content(self):
+    def test_xlsx_export_content(self):
         """Test publish and export XLS content."""
         self._publish_xls_file()
         self._make_submissions()
         self._update_dynamic_data()
-        self._check_xls_export()
+        self._check_xlsx_export()
 
-    def _check_xls_export(self):
-        xls_export_url = reverse(
-            "xls_export",
+    def _check_xlsx_export(self):
+        xlsx_export_url = reverse(
+            "xlsx_export",
             kwargs={"username": self.user.username, "id_string": self.xform.id_string},
         )
-        response = self.client.get(xls_export_url)
+        response = self.client.get(xlsx_export_url)
         expected_xls = openpyxl.open(
             filename=os.path.join(
                 self.this_directory,

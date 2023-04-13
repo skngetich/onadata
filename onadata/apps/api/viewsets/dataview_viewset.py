@@ -15,6 +15,7 @@ from rest_framework.reverse import reverse
 from rest_framework.settings import api_settings
 from rest_framework.viewsets import ModelViewSet
 
+from onadata.libs.serializers.geojson_serializer import GeoJsonSerializer
 from onadata.apps.api.permissions import DataViewViewsetPermissions
 from onadata.apps.api.tools import get_baseviewset_class
 from onadata.apps.logger.models.data_view import DataView
@@ -26,11 +27,11 @@ from onadata.libs.renderers import renderers
 from onadata.libs.serializers.data_serializer import JsonDataSerializer
 from onadata.libs.serializers.dataview_serializer import DataViewSerializer
 from onadata.libs.serializers.xform_serializer import XFormSerializer
+from onadata.libs.pagination import StandardPageNumberPagination
 from onadata.libs.utils import common_tags
 from onadata.libs.utils.api_export_tools import (
     custom_response_handler,
     export_async_export_response,
-    include_hxl_row,
     process_async_export,
     response_for_format,
 )
@@ -43,8 +44,10 @@ from onadata.libs.utils.chart_tools import (
     get_chart_data_for_field,
     get_field_from_field_name,
 )
-from onadata.libs.utils.export_tools import str_to_bool
-from onadata.libs.utils.model_tools import get_columns_with_hxl
+from onadata.libs.utils.export_tools import (
+    str_to_bool,
+    parse_request_export_options
+)
 
 # pylint: disable=invalid-name
 BaseViewset = get_baseviewset_class()
@@ -55,6 +58,64 @@ def get_form_field_chart_url(url, field):
     Returns a chart's ``url`` with the field_name ``field`` parameter appended to it.
     """
     return f"{url}?field_name={field}"
+
+
+def filter_to_field_lookup(filter_string):
+    """
+    Converts a =, < or > to a django field lookup
+    """
+    if filter_string == "=":
+        return "__iexact"
+    if filter_string == "<":
+        return "__lt"
+    return "__gt"
+
+
+def get_field_lookup(column, filter_string):
+    """
+    Convert filter_string + column into a field lookup expression
+    """
+    return "json__" + column + filter_to_field_lookup(filter_string)
+
+
+def get_filter_kwargs(filters):
+    """
+    Apply filters on a queryset
+    """
+    kwargs = {}
+    if filters:
+        for f in filters:
+            value = f"{f['value']}"
+            column = f['column']
+            filter_kwargs = {
+                get_field_lookup(column, f['filter']):
+                value
+            }
+            kwargs = {
+                **kwargs,
+                **filter_kwargs
+            }
+    return kwargs
+
+
+def apply_filters(instance_qs, filters):
+    """
+    Apply filters on a queryset
+    """
+    if filters:
+        return instance_qs.filter(**get_filter_kwargs(filters))
+    return instance_qs
+
+
+def get_dataview_instances(dataview):
+    """
+    Get all instances that belong to ths dataview
+    """
+    return apply_filters(
+        dataview.xform.instances.filter(
+            deleted_at__isnull=True
+        ), dataview.query
+    )
 
 
 # pylint: disable=too-many-ancestors
@@ -69,6 +130,7 @@ class DataViewViewSet(
     serializer_class = DataViewSerializer
     permission_classes = [DataViewViewsetPermissions]
     lookup_field = "pk"
+    pagination_class = StandardPageNumberPagination
     renderer_classes = api_settings.DEFAULT_RENDERER_CLASSES + [
         renderers.XLSRenderer,
         renderers.XLSXRenderer,
@@ -76,15 +138,34 @@ class DataViewViewSet(
         renderers.CSVZIPRenderer,
         renderers.SAVZIPRenderer,
         renderers.ZipRenderer,
+        renderers.GeoJsonRenderer,
     ]
 
     def get_serializer_class(self):
-        if self.action == "data":
+        """
+        Get a serializer class based on request format
+        """
+        export_type = self.kwargs.get("format")
+        if self.action == "data" and export_type == "geojson":
+            serializer_class = GeoJsonSerializer
+        elif self.action == "data":
             serializer_class = JsonDataSerializer
         else:
             serializer_class = self.serializer_class
 
         return serializer_class
+
+    def list(self, request, *args, **kwargs):
+        """
+        List endpoint for Filtered datasets
+        """
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        if page:
+            serializer = self.get_serializer(page, many=True)
+        else:
+            serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
 
     # pylint: disable=redefined-builtin,unused-argument
     @action(methods=["GET"], detail=True)
@@ -114,6 +195,17 @@ class DataViewViewSet(
 
             return Response(serializer.data)
 
+        if export_type == "geojson":
+            page = self.paginate_queryset(
+                get_dataview_instances(self.object)
+            )
+
+            serializer = self.get_serializer(page, many=True)
+            geojson_content_type = 'application/geo+json'
+            return Response(
+                serializer.data,
+                headers={'Content-Type': geojson_content_type})
+
         return custom_response_handler(
             request, self.object.xform, query, export_type, dataview=self.object
         )
@@ -125,40 +217,16 @@ class DataViewViewSet(
         params = request.query_params
         job_uuid = params.get("job_uuid")
         export_type = params.get("format")
-        include_hxl = params.get("include_hxl", False)
-        include_labels = params.get("include_labels", False)
-        include_labels_only = params.get("include_labels_only", False)
-        force_xlsx = params.get("force_xlsx", False)
         query = params.get("query")
         dataview = self.get_object()
         xform = dataview.xform
+        options = parse_request_export_options(params)
 
-        if include_labels is not None:
-            include_labels = str_to_bool(include_labels)
-
-        if include_labels_only is not None:
-            include_labels_only = str_to_bool(include_labels_only)
-
-        if include_hxl is not None:
-            include_hxl = str_to_bool(include_hxl)
-
-        if force_xlsx is not None:
-            force_xlsx = str_to_bool(force_xlsx)
-
-        remove_group_name = params.get("remove_group_name", False)
-        columns_with_hxl = get_columns_with_hxl(xform.survey.get("children"))
-
-        if columns_with_hxl and include_hxl:
-            include_hxl = include_hxl_row(dataview.columns, list(columns_with_hxl))
-
-        options = {
-            "remove_group_name": remove_group_name,
-            "dataview_pk": dataview.pk,
-            "include_hxl": include_hxl,
-            "include_labels": include_labels,
-            "include_labels_only": include_labels_only,
-            "force_xlsx": force_xlsx,
-        }
+        options.update(
+            {
+                "dataview_pk": dataview.pk,
+            }
+        )
         if query:
             options.update({"query": query})
 
@@ -223,9 +291,9 @@ class DataViewViewSet(
             )
 
         if (
+            field_xpath and
+            field_xpath not in dataview.columns and
             field_xpath
-            and field_xpath not in dataview.columns
-            and field_xpath
             not in [
                 common_tags.SUBMISSION_TIME,
                 common_tags.SUBMITTED_BY,
@@ -261,13 +329,13 @@ class DataViewViewSet(
         return Response(data)
 
     @action(methods=["GET"], detail=True)
-    def xls_export(self, request, *args, **kwargs):
+    def xlsx_export(self, request, *args, **kwargs):
         """Returns the data views XLS export files."""
         dataview = self.get_object()
         xform = dataview.xform
 
         token = None
-        export_type = "xls"
+        export_type = "xlsx"
         query = request.query_params.get("query", {})
         meta = request.GET.get("meta")
 

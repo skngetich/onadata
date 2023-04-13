@@ -17,7 +17,8 @@ from rest_framework import filters
 from rest_framework_guardian.filters import ObjectPermissionsFilter
 
 from onadata.apps.api.models import OrganizationProfile, Team
-from onadata.apps.logger.models import Instance, Project, XForm
+from onadata.apps.logger.models import Instance, Project, XForm, DataView, MergedXForm
+from onadata.apps.api.viewsets.dataview_viewset import get_filter_kwargs
 from onadata.apps.viewer.models import Export
 from onadata.libs.permissions import exclude_items_from_queryset_using_xform_meta_perms
 from onadata.libs.utils.common_tags import MEDIA_FILE_TYPES
@@ -27,13 +28,13 @@ from onadata.libs.utils.numeric import int_or_parse_error
 User = get_user_model()
 
 
-def _is_public_xform(export_id: int):
+def _public_xform_id_or_none(export_id: int):
     export = Export.objects.filter(pk=export_id).first()
 
-    if export:
-        return export.xform.shared_data or export.xform.shared
+    if export and (export.xform.shared_data or export.xform.shared):
+        return export.xform_id
 
-    return False
+    return None
 
 
 # pylint: disable=too-few-public-methods
@@ -146,8 +147,8 @@ class OrganizationPermissionFilter(ObjectPermissionsFilter):
 
         filtered_queryset = super().filter_queryset(request, queryset, view)
         org_users = set(
-            [group.team.organization for group in request.user.groups.all()]
-            + [o.user for o in filtered_queryset]
+            [group.team.organization for group in request.user.groups.all()] +
+            [o.user for o in filtered_queryset]
         )
 
         return queryset.model.objects.filter(user__in=org_users, user__is_active=True)
@@ -317,12 +318,37 @@ class TagFilter(filters.BaseFilterBackend):
 class XFormPermissionFilterMixin:
     """XForm permission filter."""
 
+    def _add_instance_prefix_to_dataview_filter_kwargs(self, filter_kwargs):
+        prefixed_filter_kwargs = {}
+        for kwarg in filter_kwargs:
+            prefixed_filter_kwargs["instance__" + kwarg] = filter_kwargs[kwarg]
+
+        return prefixed_filter_kwargs
+
     def _xform_filter(self, request, view, keyword):
         """Use XForm permissions"""
-
         xform = request.query_params.get("xform")
+        dataview = request.query_params.get("dataview")
+        merged_xform = request.query_params.get("merged_xform")
         public_forms = XForm.objects.none()
-        if xform:
+        dataview_kwargs = {}
+        if dataview:
+            int_or_parse_error(
+                dataview,
+                "Invalid value for dataview ID. It must be a positive integer."
+            )
+            self.dataview = get_object_or_404(DataView, pk=dataview)
+            # filter with fitlered dataset query
+            dataview_kwargs = self._add_instance_prefix_to_dataview_filter_kwargs(
+                get_filter_kwargs(self.dataview.query))
+            xform_qs = XForm.objects.filter(pk=self.dataview.xform.pk)
+        elif merged_xform:
+            int_or_parse_error(
+                merged_xform,
+                "Invalid value for Merged Dataset ID. It must be a positive integer.")
+            self.merged_xform = get_object_or_404(MergedXForm, pk=merged_xform)
+            xform_qs = self.merged_xform.xforms.all()
+        elif xform:
             int_or_parse_error(
                 xform, "Invalid value for formid. It must be a positive integer."
             )
@@ -337,7 +363,10 @@ class XFormPermissionFilterMixin:
             xforms = xform_qs.filter(shared_data=True)
         else:
             xforms = super().filter_queryset(request, xform_qs, view) | public_forms
-        return {f"{keyword}__in": xforms}
+        return {
+            **{f"{keyword}__in": xforms},
+            **dataview_kwargs
+        }
 
     def _xform_filter_queryset(self, request, queryset, view, keyword):
         kwarg = self._xform_filter(request, view, keyword)
@@ -369,7 +398,6 @@ class ProjectPermissionFilterMixin:
     def _project_filter_queryset(self, request, queryset, view, keyword):
         """Use Project Permissions"""
         kwarg = self._project_filter(request, view, keyword)
-
         return queryset.filter(**kwarg)
 
 
@@ -661,10 +689,20 @@ class ExportFilter(XFormPermissionFilterMixin, ObjectPermissionsFilter):
             Q(options__has_key="query") & Q(options__query__has_key="_submitted_by"),
         )
 
-        if request.user.is_anonymous or _is_public_xform(view.kwargs.get("pk")):
+        if request.user.is_anonymous:
             return self._xform_filter_queryset(
                 request, queryset, view, "xform_id"
             ).exclude(*has_submitted_by_key)
+
+        public_xform_id = _public_xform_id_or_none(view.kwargs.get("pk"))
+        if public_xform_id:
+            form_exports = queryset.filter(xform_id=public_xform_id)
+            current_user_form_exports = (
+                form_exports.filter(*has_submitted_by_key)
+                .filter(options__query___submitted_by=request.user.username)
+            )
+            other_form_exports = form_exports.exclude(*has_submitted_by_key)
+            return current_user_form_exports | other_form_exports
 
         old_perm_format = getattr(self, "perm_format")
 

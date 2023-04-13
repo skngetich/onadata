@@ -3,6 +3,88 @@ Changelog for Onadata
 
 ``* represents releases that introduce new migrations``
 
+v3.8.6(2023-03-07)
+------------------
+- Handle cases of duplicate metadata fields within exports
+  `PR #2385 <https://github.com/onaio/onadata/pull/2385>`_
+  [@DavisRayM]
+- Update dependencies
+  `PR #2387 <https://github.com/onaio/onadata/pull/2387>`_
+  [@DavisRayM]
+- Add backward compatibility for existing .xls form downloads
+  `PR #2383 <https://github.com/onaio/onadata/pull/2383>`_
+  [@KipSigei]
+
+v3.8.5(2023-02-22)
+------------------
+- Fix: FieldError: Cannot resolve keyword 'json' into field from Attachment model
+  `PR #2380 <https://github.com/onaio/onadata/pull/2380>`_
+  [@FrankApiyo]
+
+v3.8.4(2023-02-20)
+------------------
+- Fix choice labels bug on filtered dataset exports
+  `PR #2372 <https://github.com/onaio/onadata/pull/2372>`_
+  [@KipSigei]
+- Fix: Media endpoint currently returns an empty list for filtered and merged datasets
+  `PR #2371 <https://github.com/onaio/onadata/pull/2371>`_
+  [@FrankApiyo]
+
+v3.8.3(2023-02-14)
+------------------
+- Filter out deleted submissiions from linked GeoJSON
+  `PR #2371 <https://github.com/onaio/onadata/pull/2371>`_
+  [@KipSigei]
+
+v3.8.2(2023-02-07)
+------------------
+- Remove spaces from user-agent cached key
+  `PR #2369 <https://github.com/onaio/onadata/pull/2369>`_
+  [@KipSigei]
+- Correctly remove group name for GPS field headers for xlsx exports
+  `PR #2364 <https://github.com/onaio/onadata/pull/2364>`_
+  [@KipSigei]
+
+v3.8.1(2023-02-03)
+------------------
+- Add custom throttling class
+  `PR #2365 <https://github.com/onaio/onadata/pull/2365>`_
+  [@DavisRayM]
+
+v3.8.0(2023-02-01)
+------------------
+- Ensure that the user row is selected alongside the Token
+  `PR #2362 <https://github.com/onaio/onadata/pull/2362>`_
+  [@FrankApiyo]
+- Render filtered datasets and merged datasets as geojson
+  `PR #2360 <https://github.com/onaio/onadata/pull/2360>`_
+  [@FrankApiyo]
+- Fix an issue where GPS Data within a group is not correctly extracted when group name is removed
+  `PR #2355 <https://github.com/onaio/onadata/pull/2355>`_
+  [@DavisRayM]
+- Update setuptools & futures packages
+  `PR #2353 <https://github.com/onaio/onadata/pull/2353>`_
+  [@DavisRayM]
+- Ensure external select to csv conversion works as expected
+  `PR #2349 <https://github.com/onaio/onadata/pull/2349>`_
+  [@DavisRayM]
+- Return correct geojson for polygons and geotrace data
+  `PR #2348 <https://github.com/onaio/onadata/pull/2348>`_
+  [@FrankApiyo]
+- Ensure Excel exports are in .xlsx format
+  `PR #2346 <https://github.com/onaio/onadata/pull/2346>`_
+  [@KipSigei]
+- Ensure user profiles are created before building user permissions object
+  `PR #2344 <https://github.com/onaio/onadata/pull/2344>`_
+  [@KipSigei]
+
+v3.7.1(2022-12-21)
+------------------
+
+- Formbuilder permission changes
+  `PR #2345 <https://github.com/onaio/onadata/pull/2345>`_
+  [@DavisRayM]
+
 3.7.0(2022-12-07)
 ------------------
 - Update GeoJSON endpoint to filter by instances with geoms

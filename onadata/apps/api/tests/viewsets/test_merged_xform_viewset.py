@@ -5,19 +5,25 @@ Test merged dataset functionality.
 from __future__ import unicode_literals
 
 import csv
+import os
 import json
 from io import StringIO
+
+from django.utils import timezone
+from django.conf import settings
+from django.core.files.base import File
 
 from onadata.apps.api.tests.viewsets.test_abstract_viewset import \
     TestAbstractViewSet
 from onadata.apps.api.viewsets.charts_viewset import ChartsViewSet
+from onadata.apps.api.viewsets.attachment_viewset import AttachmentViewSet
 from onadata.apps.api.viewsets.data_viewset import DataViewSet
 from onadata.apps.api.viewsets.dataview_viewset import DataViewViewSet
 from onadata.apps.api.viewsets.merged_xform_viewset import MergedXFormViewSet
 from onadata.apps.api.viewsets.open_data_viewset import OpenDataViewSet
 from onadata.apps.api.viewsets.xform_list_viewset import XFormListViewSet
 from onadata.apps.api.viewsets.xform_viewset import XFormViewSet
-from onadata.apps.logger.models import Instance, MergedXForm, XForm
+from onadata.apps.logger.models import Attachment, Instance, MergedXForm, XForm
 from onadata.apps.logger.models.instance import FormIsMergedDatasetError
 from onadata.apps.logger.models.open_data import get_or_create_opendata
 from onadata.apps.restservice.models import RestService
@@ -25,6 +31,7 @@ from onadata.apps.restservice.viewsets.restservices_viewset import \
     RestServicesViewSet
 from onadata.libs.utils.export_tools import get_osm_data_kwargs
 from onadata.libs.utils.user_auth import get_user_default_project
+from onadata.libs.serializers.attachment_serializer import AttachmentSerializer
 
 MD = """
 | survey  |
@@ -68,6 +75,20 @@ def streaming_data(response):
     """
     return json.loads(u''.join(
         [i.decode('utf-8') for i in response.streaming_content]))
+
+
+def _add_attachments_to_instances(instance):
+    attachment_file_path = os.path.join(
+        settings.PROJECT_ROOT,
+        "libs",
+        "tests",
+        "utils",
+        "fixtures",
+        "test-image.png"
+    )
+    with open(attachment_file_path, "rb") as file:
+        Attachment.objects.create(instance=instance, media_file=File(
+            file, attachment_file_path))
 
 
 def _make_submissions_merged_datasets(merged_xform):
@@ -408,6 +429,88 @@ class TestMergedXFormViewSet(TestAbstractViewSet):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data['data'].__len__(), 0)
 
+    def test_md_geojson_response(self):
+        """Test geojson response of a merged dataset"""
+        merged_dataset = self._create_merged_dataset()
+        merged_xform = MergedXForm.objects.get(pk=merged_dataset['id'])
+
+        _make_submissions_merged_datasets(merged_xform)
+
+        # we want to check that this submission does not show up in the data
+        form_a = merged_xform.xforms.all()[0]
+        xml = '<data id="a"><fruit>Pineapple</fruit></data>'
+        instance = Instance(xform=form_a, xml=xml)
+        instance.deleted_at = timezone.now()
+        instance.deleted_by = self.user
+        instance.save()
+
+        view = MergedXFormViewSet.as_view({'get': 'data'})
+
+        request = self.factory.get('/', **self.extra)
+        response = view(request, pk=merged_dataset['id'], format='geojson')
+        self.assertEqual(response.status_code, 200)
+        # we get correct content type
+        headers = dict(response.items())
+        self.assertEqual(headers["Content-Type"], "application/geo+json")
+        del response.data['features'][0]['properties']['xform']
+        del response.data['features'][1]['properties']['xform']
+        del response.data['features'][0]['properties']['id']
+        del response.data['features'][1]['properties']['id']
+        self.assertEqual(
+            {'type': 'FeatureCollection',
+             'features':
+             [{'type': 'Feature', 'geometry': None, 'properties': {}},
+              {'type': 'Feature', 'geometry': None, 'properties': {}}]},
+            response.data
+        )
+
+        # pagination works ok!
+        request = self.factory.get('/?page=1&page_size=1', **self.extra)
+        response = view(request, pk=merged_dataset['id'], format='geojson')
+        self.assertEqual(response.status_code, 200)
+        del response.data['features'][0]['properties']['xform']
+        del response.data['features'][0]['properties']['id']
+        self.assertEqual(
+            {'type': 'FeatureCollection',
+             'features':
+             [{'type': 'Feature', 'geometry': None, 'properties': {}}]},
+            response.data
+        )
+        request = self.factory.get('/?page=2&page_size=1', **self.extra)
+        response = view(request, pk=merged_dataset['id'], format='geojson')
+        self.assertEqual(response.status_code, 200)
+        del response.data['features'][0]['properties']['xform']
+        del response.data['features'][0]['properties']['id']
+        self.assertEqual(
+            {'type': 'FeatureCollection',
+             'features':
+             [{'type': 'Feature', 'geometry': None, 'properties': {}}]},
+            response.data
+        )
+
+        # fields argument is applied correctly
+        request = self.factory.get('/?page=1&page_size=1&fields=fruit', **self.extra)
+        response = view(request, pk=merged_dataset['id'], format='geojson')
+        self.assertEqual(response.status_code, 200)
+        del response.data['features'][0]['properties']['xform']
+        del response.data['features'][0]['properties']['id']
+        self.assertEqual(
+            {'type': 'FeatureCollection',
+             'features':
+             [{'type': 'Feature', 'geometry': None,
+               'properties': {'fruit': 'orange'}}]},
+            response.data
+        )
+
+        # Invalid page error when we reqeust for a non-existent page
+        request = self.factory.get('/?page=10&page_size=1&fields=fruit', **self.extra)
+        response = view(request, pk=merged_dataset['id'], format='geojson')
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            {'detail': 'Invalid page.'},
+            response.data
+        )
+
     def test_md_csv_export(self):
         """Test CSV export of a merged dataset"""
         merged_dataset = self._create_merged_dataset()
@@ -455,6 +558,29 @@ class TestMergedXFormViewSet(TestAbstractViewSet):
             'instance__deleted_at__isnull': True,
             'instance__xform_id': xform.pk
         })
+
+    # pylint: disable=invalid-name
+    def test_merged_with_attachment_endpoint(self):
+        merged_dataset = self._create_merged_dataset()
+        merged_xform = MergedXForm.objects.get(pk=merged_dataset['id'])
+        _make_submissions_merged_datasets(merged_xform)
+
+        # Attachment viewset works ok for filtered datasets
+        attachment_list_view = AttachmentViewSet.as_view({"get": "list"})
+        all_instances = Instance.objects.filter(xform__in=merged_xform.xforms.all())
+        for instance in all_instances:
+            _add_attachments_to_instances(instance)
+        request = self.factory.get(
+            "/?merged_xform=" + str(merged_xform.pk),
+            **self.extra)
+        response = attachment_list_view(request)
+        serialized_attachments = AttachmentSerializer(
+            Attachment.objects.filter(
+                instance__xform__in=merged_xform.xforms.all()),
+            many=True, context={'request': request}).data
+        self.assertEqual(
+            response.data,
+            serialized_attachments)
 
     def test_merged_dataset_charts(self):
         """Test /charts endpoint for a merged dataset works"""

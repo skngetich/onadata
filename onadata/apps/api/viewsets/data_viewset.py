@@ -25,6 +25,9 @@ from rest_framework.response import Response
 from rest_framework.settings import api_settings
 from rest_framework.viewsets import ModelViewSet
 
+from onadata.libs.serializers.geojson_serializer import GeoJsonSerializer
+from onadata.libs.pagination import CountOverridablePageNumberPagination
+
 from onadata.apps.api.permissions import ConnectViewsetPermissions, XFormPermissions
 from onadata.apps.api.tools import add_tags_to_instance, get_baseviewset_class
 from onadata.apps.logger.models import MergedXForm, OsmData
@@ -48,7 +51,6 @@ from onadata.libs.mixins.anonymous_user_public_forms_mixin import (
 from onadata.libs.mixins.authenticate_header_mixin import AuthenticateHeaderMixin
 from onadata.libs.mixins.cache_control_mixin import CacheControlMixin
 from onadata.libs.mixins.etags_mixin import ETagsMixin
-from onadata.libs.pagination import CountOverridablePageNumberPagination
 from onadata.libs.permissions import (
     CAN_DELETE_SUBMISSION,
     filter_queryset_xform_meta_perms,
@@ -63,7 +65,6 @@ from onadata.libs.serializers.data_serializer import (
     JsonDataSerializer,
     OSMSerializer,
 )
-from onadata.libs.serializers.geojson_serializer import GeoJsonSerializer
 from onadata.libs.utils.api_export_tools import custom_response_handler
 from onadata.libs.utils.common_tools import json_stream
 from onadata.libs.utils.viewer_tools import get_enketo_urls, get_form_url
@@ -161,9 +162,9 @@ class DataViewSet(
         elif fmt == "xml":
             serializer_class = DataInstanceXMLSerializer
         elif (
-            form_pk is not None
-            and dataid is None
-            and form_pk != self.public_data_endpoint
+            form_pk is not None and
+            dataid is None and
+            form_pk != self.public_data_endpoint
         ):
             if sort or fields:
                 serializer_class = JsonDataSerializer
@@ -605,7 +606,8 @@ class DataViewSet(
 
         if export_type == "geojson":
             # raise 404 if all instances dont have geoms
-            if not xform.instances_with_geopoints:
+            if not xform.instances_with_geopoints and not (
+                    xform.polygon_xpaths() or xform.geotrace_xpaths()):
                 raise Http404(_("Not Found"))
 
             # add pagination when fetching geojson features

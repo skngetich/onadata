@@ -15,10 +15,18 @@ from openpyxl import load_workbook
 
 from onadata.libs.permissions import ReadOnlyRole
 from onadata.apps.logger.models.data_view import DataView
+from onadata.apps.logger.models import Instance, Attachment
+from onadata.apps.api.viewsets.attachment_viewset import AttachmentViewSet
 from onadata.apps.api.tests.viewsets.test_abstract_viewset import TestAbstractViewSet
 from onadata.apps.viewer.models.export import Export
 from onadata.apps.api.viewsets.project_viewset import ProjectViewSet
-from onadata.apps.api.viewsets.dataview_viewset import DataViewViewSet
+from onadata.apps.api.viewsets.dataview_viewset import (
+    DataViewViewSet,
+    filter_to_field_lookup,
+    get_field_lookup,
+    get_filter_kwargs,
+    apply_filters
+)
 from onadata.apps.api.viewsets.note_viewset import NoteViewSet
 from onadata.libs.serializers.xform_serializer import XFormSerializer
 from onadata.libs.utils.cache_tools import (
@@ -32,6 +40,7 @@ from onadata.libs.utils.common_tools import (
     filename_from_disposition,
     get_response_content,
 )
+from onadata.libs.serializers.attachment_serializer import AttachmentSerializer
 
 
 class TestDataViewViewSet(TestAbstractViewSet):
@@ -69,6 +78,55 @@ class TestDataViewViewSet(TestAbstractViewSet):
     def test_create_dataview(self):
         self._create_dataview()
 
+    def test_filter_to_field_lookup(self):
+        self.assertEqual(
+            filter_to_field_lookup("="), "__iexact"
+        )
+        self.assertEqual(
+            filter_to_field_lookup("<"), "__lt"
+        )
+        self.assertEqual(
+            filter_to_field_lookup(">"), "__gt"
+        )
+
+    def test_get_field_lookup(self):
+        self.assertEqual(
+            get_field_lookup("q1", "="), "json__q1__iexact"
+        )
+        self.assertEqual(
+            get_field_lookup("q1", "<"), "json__q1__lt"
+        )
+        self.assertEqual(
+            get_field_lookup("q1", ">"), "json__q1__gt"
+        )
+
+    def test_get_filter_kwargs(self):
+        self.assertEqual(
+            get_filter_kwargs([{"value": 2, "column": "first_column", "filter": "<"}]),
+            {'json__first_column__lt': '2'}
+        )
+        self.assertEqual(
+            get_filter_kwargs([{"value": 2, "column": "first_column", "filter": ">"}]),
+            {'json__first_column__gt': '2'}
+        )
+        self.assertEqual(
+            get_filter_kwargs([{"value": 2, "column": "first_column", "filter": "="}]),
+            {'json__first_column__iexact': '2'}
+        )
+
+    def test_apply_filters(self):
+        # update these filters
+        filters = [{'value': 'orange', 'column': 'fruit', 'filter': '='}]
+        xml = '<data id="a"><fruit>orange</fruit></data>'
+        instance = Instance(xform=self.xform, xml=xml)
+        instance.save()
+        self.assertEqual(
+            apply_filters(self.xform.instances, filters).first().xml,
+            xml
+        )
+        # delete instance
+        instance.delete()
+
     # pylint: disable=invalid-name
     def test_dataview_with_attachment_field(self):
         view = DataViewViewSet.as_view({"get": "data"})
@@ -98,6 +156,7 @@ class TestDataViewViewSet(TestAbstractViewSet):
             "project": f"http://testserver/api/v1/projects/{self.project.pk}",
             # ensure there's an attachment column(photo) in you dataview
             "columns": '["name", "age", "gender", "photo"]',
+            "query": '[{"column":"pizza_fan","filter":"=","value":"no"}]',
         }
 
         self._create_dataview(data=data)
@@ -113,9 +172,69 @@ class TestDataViewViewSet(TestAbstractViewSet):
         self.assertEqual("image/png", attachment_info.get("mimetype"))
         self.assertEqual(
             f"{self.user.username}/attachments/{self.xform.id}_{self.xform.id_string}/{media_file}",
-            attachment_info.get("filename"),
-        )
+            attachment_info.get("filename"),)
         self.assertEqual(response.status_code, 200)
+
+        # Attachment viewset works ok for filtered datasets
+        attachment_list_view = AttachmentViewSet.as_view({"get": "list"})
+        request = self.factory.get("/?dataview=" + str(self.data_view.pk), **self.extra)
+        response = attachment_list_view(request)
+        attachments = Attachment.objects.filter(
+            instance__xform=self.data_view.xform)
+        self.assertEqual(1, len(response.data))
+        self.assertEqual(self.data_view.query,
+                         [{'value': 'no', 'column': 'pizza_fan', 'filter': '='}])
+        serialized_attachments = AttachmentSerializer(
+            attachments,
+            many=True, context={'request': request}).data
+        self.assertEqual(
+            serialized_attachments,
+            response.data)
+
+        # create profile for alice
+        alice_data = {'username': 'alice', 'email': 'alice@localhost.com',
+                      'password1': 'alice', 'password2': 'alice',
+                      'first_name': 'Alice', 'last_name': 'A',
+                      'city': 'Nairobi', 'country': 'KE'}
+        alice_profile = self._create_user_profile(extra_post_data=alice_data)
+        self.extra = {"HTTP_AUTHORIZATION": f"Token {alice_profile.user.auth_token}"}
+
+        # check that user with no permisisons can not list attachment objects
+        request = self.factory.get("/?dataview=" + str(self.data_view.pk), **self.extra)
+        response = attachment_list_view(request)
+        attachments = Attachment.objects.filter(
+            instance__xform=self.data_view.xform)
+        self.assertEqual(0, len(response.data))
+        self.assertEqual(self.data_view.query,
+                         [{'value': 'no', 'column': 'pizza_fan', 'filter': '='}])
+        self.assertEqual(
+            [],
+            response.data)
+
+        # check that user with no permisisons can not view a specific attachment object
+        attachment_list_view = AttachmentViewSet.as_view({"get": "retrieve"})
+        request = self.factory.get("/?dataview=" + str(self.data_view.pk), **self.extra)
+        response = attachment_list_view(
+            request, pk=attachments.first().pk)
+        self.assertEqual(self.data_view.query,
+                         [{'value': 'no', 'column': 'pizza_fan', 'filter': '='}])
+        self.assertEqual(response.status_code, 404)
+        response_data = json.loads(json.dumps(response.data))
+        self.assertEqual(response_data, {'detail': 'Not found.'})
+
+        # a user with permissions can view a specific attachment object
+        attachment_list_view = AttachmentViewSet.as_view({"get": "retrieve"})
+        self.extra = {"HTTP_AUTHORIZATION": f"Token {self.user.auth_token}"}
+        request = self.factory.get("/?dataview=" + str(self.data_view.pk), **self.extra)
+        response = attachment_list_view(
+            request, pk=attachments.first().pk)
+        self.assertEqual(self.data_view.query,
+                         [{'value': 'no', 'column': 'pizza_fan', 'filter': '='}])
+        self.assertEqual(response.status_code, 200)
+        serialized_attachment = AttachmentSerializer(
+            attachments.first(),
+            context={'request': request}).data
+        self.assertEqual(response.data, serialized_attachment)
 
     # pylint: disable=invalid-name
     def test_get_dataview_form_definition(self):
@@ -819,7 +938,7 @@ class TestDataViewViewSet(TestAbstractViewSet):
 
         request = self.factory.get(
             "/",
-            data={"format": "xls", "force_xlsx": "true", "include_labels": "true"},
+            data={"format": "xlsx", "force_xlsx": "true", "include_labels": "true"},
             **self.extra,
         )
         response = view(request, pk=self.data_view.pk)
@@ -876,6 +995,176 @@ class TestDataViewViewSet(TestAbstractViewSet):
         response = view(request, pk=dataview_pk)
 
         self.assertIsNotNone(next(response.streaming_content), expected_output)
+
+    # pylint: disable=invalid-name
+    @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
+    @patch("onadata.apps.api.viewsets.dataview_viewset.AsyncResult")
+    def test_xlsx_export_with_choice_labels(self, async_result):
+        """
+        Test that choice labels are present in xlsx export when enabled
+        """
+        xform = self.xform
+        project = self.project
+        # add pizza_type column which is has choice labels
+        data = {
+            "name": "My DataView",
+            "xform": f"http://testserver/api/v1/forms/{xform.pk}",
+            "project": f"http://testserver/api/v1/projects/{project.pk}",
+            "columns": '["name", "age", "gender", "pizza_type"]',
+            "query": (
+                    '[{"column":"age","filter":"=","value":"28"}]'
+            ),
+        }
+        self._create_dataview(data=data)
+
+        view = DataViewViewSet.as_view(
+            {
+                "get": "export_async",
+            }
+        )
+
+        data = {
+            "format": "xlsx",
+            "show_choice_labels": "true"
+        }
+
+        request = self.factory.get("/", data=data, **self.extra)
+        response = view(request, pk=self.data_view.pk)
+        self.assertIsNotNone(response.data)
+
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue("job_uuid" in response.data)
+        task_id = response.data.get("job_uuid")
+
+        export_pk = Export.objects.all().order_by("pk").reverse()[0].pk
+
+        # metaclass for mocking results
+        job = type("AsyncResultMock", (), {"state": "SUCCESS", "result": export_pk})
+        async_result.return_value = job
+
+        get_data = {"job_uuid": task_id}
+        request = self.factory.get("/", data=get_data, **self.extra)
+        response = view(request, pk=self.data_view.pk)
+
+        self.assertIn("export_url", response.data)
+
+        self.assertTrue(async_result.called)
+        self.assertEqual(response.status_code, 202)
+        export = Export.objects.get(task_id=task_id)
+        self.assertTrue(export.is_successful)
+        workbook = load_workbook(export.full_filepath)
+        workbook.iso_dates = True
+        sheet_name = workbook.get_sheet_names()[0]
+        main_sheet = workbook.get_sheet_by_name(sheet_name)
+        sheet_headers = list(main_sheet.values)[0]
+        sheet_data = list(main_sheet.values)[1]
+        inst = self.xform.instances.get(id=sheet_data[4])
+        expected_headers = (
+            'name',
+            'age',
+            'gender',
+            'pizza_type',
+            '_id',
+            '_uuid',
+            '_submission_time',
+            '_index',
+            '_parent_table_name',
+            '_parent_index',
+            '_tags',
+            '_notes',
+            '_version',
+            '_duration',
+            '_submitted_by',
+        )
+        expected_data = (
+            'Dennis Wambua',
+            28,
+            'Male',
+            'New York think crust!',
+            inst.id,
+            inst.uuid,
+            inst.date_created.replace(microsecond=0, tzinfo=None),
+            1,
+            None,
+            -1,
+            None,
+            None,
+            '4444',
+            50,
+            inst.user.username,
+        )
+        self.assertEqual(expected_headers, sheet_headers)
+        self.assertEqual(expected_data, sheet_data)
+
+    # pylint: disable=invalid-name
+    @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
+    @patch("onadata.apps.api.viewsets.dataview_viewset.AsyncResult")
+    def test_csv_export_with_choice_labels(self, async_result):
+        """
+        Test that choice labels are present in csv export when enabled
+        """
+        xform = self.xform
+        project = self.project
+        # add pizza_type column which is has choice labels
+        data = {
+            "name": "My DataView",
+            "xform": f"http://testserver/api/v1/forms/{xform.pk}",
+            "project": f"http://testserver/api/v1/projects/{project.pk}",
+            "columns": '["name", "age", "gender", "pizza_type"]',
+            "query": (
+                    '[{"column":"age","filter":"=","value":"28"}]'
+            ),
+        }
+        self._create_dataview(data=data)
+
+        view = DataViewViewSet.as_view(
+            {
+                "get": "export_async",
+            }
+        )
+
+        data = {
+            "format": "csv",
+            "show_choice_labels": "true"
+        }
+
+        request = self.factory.get("/", data=data, **self.extra)
+        response = view(request, pk=self.data_view.pk)
+        self.assertIsNotNone(response.data)
+
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue("job_uuid" in response.data)
+        task_id = response.data.get("job_uuid")
+
+        export_pk = Export.objects.all().order_by("pk").reverse()[0].pk
+
+        # metaclass for mocking results
+        job = type("AsyncResultMock", (), {"state": "SUCCESS", "result": export_pk})
+        async_result.return_value = job
+
+        get_data = {"job_uuid": task_id}
+        request = self.factory.get("/", data=get_data, **self.extra)
+        response = view(request, pk=self.data_view.pk)
+
+        self.assertIn("export_url", response.data)
+
+        self.assertTrue(async_result.called)
+        self.assertEqual(response.status_code, 202)
+        export = Export.objects.get(task_id=task_id)
+        self.assertTrue(export.is_successful)
+        with default_storage.open(export.filepath, "r") as f:
+            expected_data = [
+                'Dennis Wambua',
+                '28',
+                'Male',
+                'New York think crust!'
+            ]
+            expected_headers = ['name', 'age', 'gender', 'pizza_type']
+            csv_reader = csv.reader(f)
+            headers = next(csv_reader)
+            self.assertEqual(expected_headers, headers)
+            data = next(csv_reader)
+            self.assertEqual(expected_data, data)
 
     # pylint: disable=invalid-name
     def test_csv_export_with_hxl_support(self):
@@ -1134,6 +1423,57 @@ class TestDataViewViewSet(TestAbstractViewSet):
 
         self.assertIn("location", response.data[0])
         self.assertIn("_geolocation", response.data[0])
+
+        # geojson pagination, fields and geofield params works ok
+        request = self.factory.get(
+            "/?geofield=_geolocation&page=1&page_size=1&fields=name",
+            **self.extra)
+        response = view(request, pk=self.data_view.pk, format='geojson')
+        # we get correct content type
+        headers = dict(response.items())
+        self.assertEqual(headers["Content-Type"], "application/geo+json")
+        self.assertEqual(response.status_code, 200)
+        del response.data['features'][0]['properties']['xform']
+        del response.data['features'][0]['properties']['id']
+        self.assertEqual(
+            {'type': 'FeatureCollection',
+             'features': [
+                 {'type': 'Feature',
+                  'geometry': None,
+                  'properties': {'name': 'Kameli'}}]},
+            response.data
+        )
+        request = self.factory.get(
+            "/?geofield=_geolocation&page=9&page_size=1&fields=name",
+            **self.extra)
+        response = view(request, pk=self.data_view.pk, format='geojson')
+        self.assertEqual(response.status_code, 200)
+        del response.data['features'][0]['properties']['xform']
+        del response.data['features'][0]['properties']['id']
+        self.assertEqual(
+            {'type': 'FeatureCollection',
+             'features':
+             [
+                 {'type': 'Feature',
+                  'geometry':
+                  {'type':
+                   'GeometryCollection',
+                   'geometries':
+                   [
+                       {'type': 'Point',
+                        'coordinates': [36.8304, -1.2655]}]},
+                  'properties': {'name': 'Kameli'}}]},
+            response.data
+        )
+        request = self.factory.get(
+            "/?geofield=_geolocation&page=10&page_size=1&fields=name",
+            **self.extra)
+        response = view(request, pk=self.data_view.pk, format='geojson')
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            {'detail': 'Invalid page.'},
+            response.data
+        )
 
     # pylint: disable=invalid-name
     def test_dataview_project_cache_cleared(self):
@@ -1538,11 +1878,11 @@ class TestDataViewViewSet(TestAbstractViewSet):
         first_datetime = start_date.strftime(MONGO_STRFTIME)
         second_datetime = start_date + timedelta(days=1, hours=20)
         query_str = (
-            '{"_submission_time": {"$gte": "'
-            + first_datetime
-            + '", "$lte": "'
-            + second_datetime.strftime(MONGO_STRFTIME)
-            + '"}}'
+            '{"_submission_time": {"$gte": "' +
+            first_datetime +
+            '", "$lte": "' +
+            second_datetime.strftime(MONGO_STRFTIME) +
+            '"}}'
         )
 
         view = DataViewViewSet.as_view(
@@ -1554,7 +1894,7 @@ class TestDataViewViewSet(TestAbstractViewSet):
         request = self.factory.get(
             "/",
             data={
-                "format": "xls",
+                "format": "xlsx",
                 "force_xlsx": "true",
                 "include_labels": "true",
                 "query": query_str,
@@ -1585,6 +1925,7 @@ class TestDataViewViewSet(TestAbstractViewSet):
         export = Export.objects.get(task_id=task_id)
         self.assertTrue(export.is_successful)
         workbook = load_workbook(export.full_filepath)
+        workbook.iso_dates = True
         sheet_name = workbook.get_sheet_names()[0]
         main_sheet = workbook.get_sheet_by_name(sheet_name)
         self.assertIn("Gender", tuple(main_sheet.values)[1])
@@ -1600,11 +1941,11 @@ class TestDataViewViewSet(TestAbstractViewSet):
         first_datetime = start_date.strftime(MONGO_STRFTIME)
         second_datetime = start_date + timedelta(days=1, hours=20)
         query_str = (
-            '{"_submission_time": {"$gte": "'
-            + first_datetime
-            + '", "$lte": "'
-            + second_datetime.strftime(MONGO_STRFTIME)
-            + '"}}'
+            '{"_submission_time": {"$gte": "' +
+            first_datetime +
+            '", "$lte": "' +
+            second_datetime.strftime(MONGO_STRFTIME) +
+            '"}}'
         )
         count = Export.objects.all().count()
 
@@ -1643,11 +1984,11 @@ class TestDataViewViewSet(TestAbstractViewSet):
         first_datetime = start_date.strftime(MONGO_STRFTIME)
         second_datetime = start_date + timedelta(days=1, hours=20)
         query_str = (
-            '{"_submission_time": {"$gte": "'
-            + first_datetime
-            + '", "$lte": "'
-            + second_datetime.strftime(MONGO_STRFTIME)
-            + '"}}'
+            '{"_submission_time": {"$gte": "' +
+            first_datetime +
+            '", "$lte": "' +
+            second_datetime.strftime(MONGO_STRFTIME) +
+            '"}}'
         )
         count = Export.objects.all().count()
 

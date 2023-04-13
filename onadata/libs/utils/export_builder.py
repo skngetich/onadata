@@ -270,7 +270,11 @@ def _get_var_name(title, var_names):
         .replace("}", "")
     )
     var_name = _check_sav_column(var_name, var_names)
-    var_name = "@" + var_name if var_name.startswith("_") else var_name
+
+    if ("/" in title and title.split("/")[1].startswith("_")) or var_name.startswith(
+        "_"
+    ):
+        var_name = "@" + var_name
     var_names.append(var_name)
     return var_name, var_names
 
@@ -553,7 +557,7 @@ class ExportBuilder:
                     if child.bind.get("type") == GEOPOINT_BIND_TYPE:
                         # add columns for geopoint components
                         xpaths = DataDictionary.get_additional_geopoint_xpaths(
-                            child.get_abbreviated_xpath()
+                            child.get_abbreviated_xpath(), remove_group_name
                         )
                         for xpath in xpaths:
                             _title = ExportBuilder.format_field_title(
@@ -978,7 +982,7 @@ class ExportBuilder:
         return generated_name
 
     # pylint: disable=too-many-locals,too-many-statements,unused-argument
-    def to_xls_export(self, path, data, *args, **kwargs):
+    def to_xlsx_export(self, path, data, *args, **kwargs):
         """Export data to a spreadsheet document."""
 
         def write_row(data, work_sheet, fields, work_sheet_titles):

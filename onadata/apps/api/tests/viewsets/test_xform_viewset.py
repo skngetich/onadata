@@ -32,6 +32,7 @@ from django_digest.test import DigestAuth
 from flaky import flaky
 from httmock import HTTMock
 from mock import Mock, patch
+from onadata.libs.utils.api_export_tools import get_existing_file_format
 from rest_framework import status
 from rest_framework.viewsets import ModelViewSet
 
@@ -61,6 +62,7 @@ from onadata.apps.logger.xform_instance_parser import XLSFormError
 from onadata.apps.main.models import MetaData
 from onadata.apps.messaging.constants import FORM_UPDATED, XFORM
 from onadata.apps.viewer.models import Export
+from onadata.apps.viewer.models.export import ExportTypeError
 from onadata.libs.permissions import (
     ROLES_ORDERED,
     DataEntryMinorRole,
@@ -817,14 +819,14 @@ class TestXFormViewSet(TestAbstractViewSet):
             )
 
             # XLS format
-            response = view(request, pk=formid, format="xls")
+            response = view(request, pk=formid, format="xlsx")
             self.assertEqual(response.status_code, 200)
             self.assertNotEqual(response.get("Cache-Control"), None)
 
             # test correct file name
             self.assertEqual(
                 response.get("Content-Disposition"),
-                "attachment; filename=" + self.xform.id_string + "." + "xls",
+                "attachment; filename=" + self.xform.id_string + "." + "xlsx",
             )
 
             xml_path = os.path.join(
@@ -861,6 +863,39 @@ class TestXFormViewSet(TestAbstractViewSet):
                 self.xform.version, "201411120717"
             )
             self.assertEqual(response_xml, expected_doc.toxml())
+
+    def test_existing_form_format(self):
+        with HTTMock(enketo_mock):
+            self._publish_xls_form_to_project()
+            view = XFormViewSet.as_view({"get": "form"})
+            formid = self.xform.pk
+            request = self.factory.get("/", **self.extra)
+            # get existing form format
+            exsting_format = get_existing_file_format(self.xform.xls, 'xls')
+
+            # XLSX format
+            response = view(request, pk=formid, format="xlsx")
+            self.assertEqual(response.status_code, 200)
+            self.assertNotEqual(response.get("Cache-Control"), None)
+
+            # test correct content disposition
+            # ensure it still maintains the existing form extension
+            self.assertEqual(
+                response.get("Content-Disposition"),
+                "attachment; filename=" + self.xform.id_string + "." + exsting_format,
+            )
+
+            # XLS format
+            response = view(request, pk=formid, format="xls")
+            self.assertEqual(response.status_code, 200)
+            self.assertNotEqual(response.get("Cache-Control"), None)
+
+            # test correct content disposition
+            # ensure it still maintains the existing form extension
+            self.assertEqual(
+                response.get("Content-Disposition"),
+                "attachment; filename=" + self.xform.id_string + "." + exsting_format,
+            )
 
     def test_form_tags(self):
         with HTTMock(enketo_mock):
@@ -2208,7 +2243,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             request = self.factory.get("/", data=data, **self.extra)
             with HTTMock(external_mock):
                 # External export
-                response = view(request, pk=formid, format="xls")
+                response = view(request, pk=formid, format="xlsx")
                 self.assertEqual(response.status_code, 302)
                 expected_url = "http://xls_server/xls/ee3ff9d8f5184fc4a8fdebc2547cc059"
                 self.assertEqual(response.url, expected_url)
@@ -2250,7 +2285,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             request = self.factory.get("/", data=data, **self.extra)
             with HTTMock(external_mock_single_instance):
                 # External export
-                response = view(request, pk=formid, format="xls")
+                response = view(request, pk=formid, format="xlsx")
                 self.assertEqual(response.status_code, 302)
                 expected_url = "http://xls_server/xls/ee3ff9d8f5184fc4a8fdebc2547cc059"
                 self.assertEqual(response.url, expected_url)
@@ -2288,7 +2323,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             request = self.factory.get("/", data=data, **self.extra)
 
             # External export
-            response = view(request, pk=formid, format="xls")
+            response = view(request, pk=formid, format="xlsx")
 
             self.assertEqual(response.status_code, 400)
             self.assertEqual(response.get("Cache-Control"), None)
@@ -3523,7 +3558,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             )
             formid = self.xform.pk
 
-            for format in ["xls", "osm", "csv"]:
+            for format in ["xlsx", "osm", "csv"]:
                 request = self.factory.get("/", data={"format": format}, **self.extra)
                 response = view(request, pk=formid)
                 self.assertIsNotNone(response.data)
@@ -3612,7 +3647,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             )
             formid = self.xform.pk
 
-            format = "xls"
+            format = "xlsx"
             request = self.factory.get("/", data={"format": format}, **self.extra)
             response = view(request, pk=formid)
             self.assertIsNotNone(response.data)
@@ -3668,7 +3703,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             with HTTMock(external_mock):
                 # External export
                 request = self.factory.get(
-                    "/", data={"format": "xls", "meta": metadata.pk}, **self.extra
+                    "/", data={"format": "xlsx", "meta": metadata.pk}, **self.extra
                 )
                 response = view(request, pk=formid)
 
@@ -3680,7 +3715,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             get_data = {"job_uuid": data.get("job_uuid")}
 
             request = self.factory.get("/", data=get_data, **self.extra)
-            response = view(request, pk=formid, format="xls")
+            response = view(request, pk=formid, format="xlsx")
             self.assertTrue(async_result.called)
             self.assertEqual(response.status_code, 202)
 
@@ -3725,7 +3760,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
                 request = self.factory.get(
                     "/",
                     data={
-                        "format": "xls",
+                        "format": "xlsx",
                         "meta": metadata.pk,
                         "data_id": self.xform.instances.all()[0].pk,
                     },
@@ -3741,7 +3776,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             get_data = {"job_uuid": data.get("job_uuid")}
 
             request = self.factory.get("/", data=get_data, **self.extra)
-            response = view(request, pk=formid, format="xls")
+            response = view(request, pk=formid, format="xlsx")
             self.assertTrue(async_result.called)
             self.assertEqual(response.status_code, 202)
 
@@ -3794,7 +3829,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
 
             with HTTMock(external_mock_single_instance):
                 # External export
-                response = view(request, pk=formid, format="xls")
+                response = view(request, pk=formid, format="xlsx")
                 self.assertEqual(response.status_code, 302)
                 expected_url = "http://xls_server/xls/ee3ff9d8f5184fc4a8fdebc2547cc059"
                 self.assertEqual(response.url, expected_url)
@@ -3805,7 +3840,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
 
             with HTTMock(external_mock_single_instance2):
                 # External export
-                response = view(request, pk=formid, format="xls")
+                response = view(request, pk=formid, format="xlsx")
                 self.assertEqual(response.status_code, 302)
                 expected_url = "http://xls_server/xls/ee3ff9d8f5184fc4a8fdebc2547cc057"
                 self.assertEqual(response.url, expected_url)
@@ -5506,14 +5541,25 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
                 self.assertIsNotNone(metadata)
 
                 csv_reader = csv.reader(codecs.iterdecode(metadata.data_file, "utf-8"))
-                header = next(csv_reader)
-                name_index = header.index("name")
-                for row in csv_reader:
-                    try:
-                        int(row[name_index])
-                        self.assertTrue(isinstance(row[name_index], str))
-                    except ValueError:
-                        self.assertTrue(isinstance(row[name_index], str))
+                expected_data = [
+                    ["list_name", "name", "label", "state", "county"],
+                    ["states", "1", "Texas", "", ""],
+                    ["states", "2", "Washington", "", ""],
+                    ["counties", "b1", "King", "2", ""],
+                    ["counties", "b2", "Pierce", "2", ""],
+                    ["counties", "b3", "King", "1", ""],
+                    ["counties", "b4", "Cameron", "1", ""],
+                    ["cities", "dumont", "Dumont", "1", "b3"],
+                    ["cities", "finney", "Finney", "1", "b3"],
+                    ["cities", "brownsville", "brownsville", "1", "b4"],
+                    ["cities", "harlingen", "harlingen", "1", "b4"],
+                    ["cities", "seattle", "Seattle", "2", "b3"],
+                    ["cities", "redmond", "Redmond", "2", "b3"],
+                    ["cities", "tacoma", "Tacoma", "2", "b2"],
+                    ["cities", "puyallup", "Puyallup", "2", "b2"],
+                ]
+                for index, row in enumerate(csv_reader):
+                    self.assertEqual(row, expected_data[index])
 
     def test_csv_xls_import_errors(self):
         with HTTMock(enketo_mock):

@@ -69,13 +69,13 @@ from onadata.libs.utils.export_tools import (
 from onadata.libs.utils.google import create_flow
 from onadata.libs.utils.logger_tools import response_with_mimetype_and_name
 from onadata.libs.utils.model_tools import get_columns_with_hxl
+from onadata.settings.common import XLS_EXTENSIONS
 
 # Supported external exports
-EXTERNAL_EXPORT_TYPES = ["xls"]
+EXTERNAL_EXPORT_TYPES = ["xlsx"]
 
 EXPORT_EXT = {
-    "xls": Export.XLS_EXPORT,
-    "xlsx": Export.XLS_EXPORT,
+    "xlsx": Export.XLSX_EXPORT,
     "csv": Export.CSV_EXPORT,
     "csvzip": Export.CSV_ZIP_EXPORT,
     "savzip": Export.SAV_ZIP_EXPORT,
@@ -406,7 +406,7 @@ def _set_start_end_params(request, query):
 def _get_extension_from_export_type(export_type):
     extension = export_type
 
-    if export_type == Export.XLS_EXPORT:
+    if export_type == Export.XLSX_EXPORT:
         extension = "xlsx"
     elif export_type in [Export.CSV_ZIP_EXPORT, Export.SAV_ZIP_EXPORT]:
         extension = "zip"
@@ -609,6 +609,16 @@ def response_for_format(data, format=None):
             json.loads(data.json) if isinstance(data.json, str) else data.json
         )
     return Response(formatted_data)
+
+
+def get_existing_file_format(data, format):
+    """
+    Util function to extract the existing form extension
+    """
+    if format in XLS_EXTENSIONS:
+        existing_file_format = data.name.split(".")[-1]
+        return existing_file_format
+    return format
 
 
 def generate_google_web_flow(request):

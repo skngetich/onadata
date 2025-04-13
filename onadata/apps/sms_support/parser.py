@@ -48,7 +48,8 @@ class SMSCastingError(ValueError):
 
 
 # pylint: disable=too-many-locals,too-many-branches,too-many-statements
-def parse_sms_text(xform, identity, sms_text):  # noqa C901
+# pylint: disable=too-many-return-statements
+def parse_sms_text(xform, identity, sms_text):
     """Parses an SMS text to return XForm specific answers, media, notes."""
 
     json_survey = xform.json_dict()
@@ -71,7 +72,6 @@ def parse_sms_text(xform, identity, sms_text):  # noqa C901
         group_id, group_text = [s.strip() for s in group.split(None, 1)]
         groups.update({group_id: [s.strip() for s in group_text.split(None)]})
 
-    # pylint: disable=too-many-locals,too-many-return-statements,too-many-branches
     def cast_sms_value(value, question, medias=None):
         """Check data type of value and return cleaned version"""
 
@@ -93,8 +93,10 @@ def parse_sms_text(xform, identity, sms_text):  # noqa C901
         def safe_wrap(func):
             try:
                 return func()
-            except Exception as e:
-                raise SMSCastingError(_("%(error)s") % {"error": e}, xlsf_name) from e
+            except Exception as error:
+                raise SMSCastingError(
+                    _("%(error)s") % {"error": error}, xlsf_name
+                ) from error
 
         def media_value(value, medias):
             """handle media values
@@ -105,11 +107,11 @@ def parse_sms_text(xform, identity, sms_text):  # noqa C901
                 filename, b64content = value.split(";", 1)
                 medias.append((filename, base64.b64decode(b64content)))
                 return filename
-            except (AttributeError, TypeError, binascii.Error) as e:
+            except (AttributeError, TypeError, binascii.Error) as error:
                 raise SMSCastingError(
-                    _("Media file format incorrect. %(except)r") % {"except": e},
+                    _("Media file format incorrect. %(except)r") % {"except": error},
                     xlsf_name,
-                ) from e
+                ) from error
 
         if xlsf_type == "text":
             return safe_wrap(lambda: str(value))
@@ -145,13 +147,13 @@ def parse_sms_text(xform, identity, sms_text):  # noqa C901
                     raise SMSCastingError(err_msg, xlsf_name)
                 if len(geodata) == 4:
                     # check that altitude and accuracy are integers
-                    for v in geodata[2:4]:
-                        int(v)
+                    for geo_value in geodata[2:4]:
+                        int(geo_value)
                 elif len(geodata) == 3:
                     # check that altitude is integer
                     int(geodata[2])
-            except ValueError as e:
-                raise SMSCastingError(e, xlsf_name) from e
+            except ValueError as error:
+                raise SMSCastingError(error, xlsf_name) from error
             return " ".join(geodata)
         if xlsf_type in MEDIA_TYPES:
             # media content (image, video, audio) must be formatted as:
@@ -237,6 +239,7 @@ def parse_sms_text(xform, identity, sms_text):  # noqa C901
             # contain medias questions (and medias are disabled)
             sidx = idx - step_back
 
+            answer = ""
             if question_type in META_FIELDS:
                 # some question are not to be fed by users
                 real_value = get_meta_value(xlsf_type=question_type, identity=identity)
@@ -375,10 +378,10 @@ def process_incoming_smses(username, incomings, id_string=None):  # noqa C901
         for idx, note in enumerate(notes):
             try:
                 notes[idx] = note.replace("${", "{").format(**data)
-            except AttributeError as e:
-                logging.exception("Updating note threw exception: %s", str(e))
+            except AttributeError as error:
+                logging.exception("Updating note threw exception: %s", str(error))
 
-        # process_incoming expectes submission to be a file-like object
+        # process_incoming expects submission to be a file-like object
         xforms.append(BytesIO(xml_submission.encode("utf-8")))
         medias.append(medias_submission)
         json_submissions.append(json_submission)
@@ -387,8 +390,8 @@ def process_incoming_smses(username, incomings, id_string=None):  # noqa C901
     for incoming in incomings:
         try:
             process_incoming(incoming, id_string)
-        except (SMSCastingError, SMSSyntaxError, ValueError) as e:
-            responses.append({"code": SMS_PARSING_ERROR, "text": str(e)})
+        except (SMSCastingError, SMSSyntaxError, ValueError) as error:
+            responses.append({"code": SMS_PARSING_ERROR, "text": str(error)})
 
     for idx, xform in enumerate(xforms):
         # generate_instance expects media as a request.FILES.values() list

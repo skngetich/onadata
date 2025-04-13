@@ -2,6 +2,7 @@
 """
 Test base class for API viewset tests.
 """
+
 import json
 import os
 import re
@@ -11,6 +12,7 @@ from tempfile import NamedTemporaryFile
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.models import Permission
+from django.db.models.signals import post_save
 from django.test import TestCase
 
 import requests
@@ -29,18 +31,25 @@ from onadata.apps.api.viewsets.organization_profile_viewset import (
 from onadata.apps.api.viewsets.project_viewset import ProjectViewSet
 from onadata.apps.api.viewsets.team_viewset import TeamViewSet
 from onadata.apps.api.viewsets.widget_viewset import WidgetViewSet
-from onadata.apps.logger.models import Attachment, Instance, Project, XForm
+from onadata.apps.logger.models import (
+    Attachment,
+    Entity,
+    EntityList,
+    Instance,
+    Project,
+    XForm,
+)
 from onadata.apps.logger.models.data_view import DataView
 from onadata.apps.logger.models.widget import Widget
 from onadata.apps.logger.views import submission
 from onadata.apps.logger.xform_instance_parser import clean_and_parse_xml
 from onadata.apps.main import tests as main_tests
 from onadata.apps.main.models import MetaData, UserProfile
+from onadata.apps.main.tests.test_base import TestBase
 from onadata.apps.viewer.models import DataDictionary
+from onadata.apps.viewer.models.data_dictionary import create_or_update_export_register
 from onadata.libs.serializers.project_serializer import ProjectSerializer
-from onadata.libs.test_utils.pyxform_test_case import PyxformMarkdown
 from onadata.libs.utils.common_tools import merge_dicts
-from onadata.libs.utils.user_auth import get_user_default_project
 
 # pylint: disable=invalid-name
 User = get_user_model()
@@ -95,7 +104,7 @@ def get_mocked_response_for_file(file_object, filename, status_code=200):
 
 
 # pylint: disable=too-many-instance-attributes
-class TestAbstractViewSet(PyxformMarkdown, TestCase):
+class TestAbstractViewSet(TestBase, TestCase):
     """
     Base test class for API viewsets.
     """
@@ -128,6 +137,20 @@ class TestAbstractViewSet(PyxformMarkdown, TestCase):
         self.factory = APIRequestFactory()
         self._login_user_and_profile()
         self.maxDiff = None
+        # Disable signals
+        post_save.disconnect(
+            sender=DataDictionary, dispatch_uid="create_or_update_export_register"
+        )
+
+    def tearDown(self):
+        # Enable signals
+        post_save.connect(
+            sender=DataDictionary,
+            dispatch_uid="create_or_update_export_register",
+            receiver=create_or_update_export_register,
+        )
+
+        TestCase.tearDown(self)
 
     def user_profile_data(self):
         """Returns the user profile python object."""
@@ -186,6 +209,8 @@ class TestAbstractViewSet(PyxformMarkdown, TestCase):
             )
         )
         self.extra = {"HTTP_AUTHORIZATION": f"Token {self.user.auth_token}"}
+        self.login_username = self.profile_data["username"]
+        self.login_password = self.profile_data["password1"]
 
     def _org_create(self, org_data=None):
         org_data = {} if org_data is None else org_data
@@ -194,6 +219,7 @@ class TestAbstractViewSet(PyxformMarkdown, TestCase):
         response = view(request)
         self.assertEqual(response.status_code, 200)
         data = {
+            "email": "mail@mail-server.org",
             "org": "denoinc",
             "name": "Dennis",
             "city": "Denoville",
@@ -217,6 +243,7 @@ class TestAbstractViewSet(PyxformMarkdown, TestCase):
         data["url"] = f"http://testserver/api/v1/orgs/{data['org']}"
         data["user"] = f"http://testserver/api/v1/users/{data['org']}"
         data["creator"] = "http://testserver/api/v1/users/bob"
+        data.pop("email")
         self.assertDictContainsSubset(data, response.data)
         # pylint: disable=attribute-defined-outside-init
         self.company_data = response.data
@@ -343,7 +370,7 @@ class TestAbstractViewSet(PyxformMarkdown, TestCase):
                 # pylint: disable=attribute-defined-outside-init
                 self.form_data = response.data
 
-    # pylint: disable=too-many-arguments,too-many-locals,unused-argument
+    # pylint: disable=too-many-arguments, too-many-positional-arguments,too-many-locals,unused-argument
     def _make_submission(
         self,
         path,
@@ -605,7 +632,7 @@ class TestAbstractViewSet(PyxformMarkdown, TestCase):
         )
         response = view(request)
 
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 201, response.data)
         self.assertEqual(count + 1, Widget.objects.all().count())
 
         # pylint: disable=attribute-defined-outside-init
@@ -683,19 +710,16 @@ class TestAbstractViewSet(PyxformMarkdown, TestCase):
 
         return request
 
-    def _publish_markdown(self, md, user, project=None, **kwargs):
-        kwargs["name"] = "data"
-        survey = self.md_to_pyxform_survey(md, kwargs=kwargs)
-        survey["sms_keyword"] = survey["id_string"]
-        if not project or not hasattr(self, "project"):
-            project = get_user_default_project(user)
-        xform = DataDictionary(
-            created_by=user,
-            user=user,
-            xml=survey.to_xml(),
-            json=survey.to_json(),
-            project=project,
+    def _create_entity(self):
+        self._publish_registration_form(self.user)
+        self.entity_list = EntityList.objects.get(name="trees")
+        self.entity = Entity.objects.create(
+            entity_list=self.entity_list,
+            json={
+                "geometry": "-1.286905 36.772845 0 0",
+                "species": "purpleheart",
+                "circumference_cm": 300,
+                "label": "300cm purpleheart",
+            },
+            uuid="dbee4c32-a922-451c-9df7-42f40bf78f48",
         )
-        xform.save()
-
-        return xform

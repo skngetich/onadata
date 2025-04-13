@@ -3,6 +3,681 @@ Changelog for Onadata
 
 ``* represents releases that introduce new migrations``
 
+v5.0.2 (2025-04-09)
+-------------------
+- Update ona-oidc to v2.0.1 
+  `PR #2777 <https://github.com/onaio/onadata/pull/2794>`
+  [@ukanga]
+
+v5.0.1 (2025-04-09)
+-------------------
+- Pin Django version to < 5.2 
+  `PR #2777 <https://github.com/onaio/onadata/pull/2793>`
+  [@ukanga]
+
+v5.0.0 (2025-04-08)
+-------------------
+- Django upgrade to version 5.x.x * 
+  `PR #2777 <https://github.com/onaio/onadata/pull/2777>`
+  [@ukanga]
+
+v4.14.0(2025-03-26)
+-------------------
+- Fix new columns not showing in CSV after replacing form
+  `PR #2779 <https://github.com/onaio/onadata/pull/2779>`
+  [@kelvin-muchiri]
+- Add a new mgt command that applies entitylist perms
+  `PR #2785 <https://github.com/onaio/onadata/pull/2785>`
+  [@FrankApiyo]
+
+v4.13.0(2025-02-25)
+-------------------
+- Fix  Package 'openjdk-11-jre-headless' has no installation candidate
+  `PR #2776 <https://github.com/onaio/onadata/pull/2776>`
+  [@kelvin-muchiri]
+- Ensure only authenticated users can list users
+  `PR #2778 <https://github.com/onaio/onadata/pull/2778>`
+  [@FrankApiyo]
+- Fix form permissions not updated when project is transferred
+  `PR #2775 <https://github.com/onaio/onadata/pull/2775>`
+  [@kelvin-muchiri]
+- Security Updates
+  `PR #2773 <https://github.com/onaio/onadata/pull/2773>`
+  [@kelvin-muchiri]
+- Add debian bookworm unstable to include newer glibc
+  `PR #2781 <https://github.com/onaio/onadata/pull/2781>`
+  [@ukanga]
+
+v4.12.0(2025-01-30)
+-------------------
+- Fix XForm permissions not applied after transferring project via management command
+  `PR #2770 <https://github.com/onaio/onadata/pull/2770>`
+  [@kelvin-muchiri]
+- Ensure projects are returned in the reverse order of creation
+  `PR #2768 <https://github.com/onaio/onadata/pull/2768>`
+  [@FrankApiyo]
+- Optimise CSV export by saving columns
+  `PR #2762 <https://github.com/onaio/onadata/pull/2762>`
+  [@kelvin-muchiri]
+
+v4.11.2(2025-01-22)
+-------------------
+- Fix exception Instance.DoesNotExist when registering Instance repeats
+  `PR #2763 <https://github.com/onaio/onadata/pull/2763>`
+  [@kelvin-muchiri]
+- Allow unapproved submissions when registering export repeats
+  `PR #2764 <https://github.com/onaio/onadata/pull/2764>`
+  [@kelvin-muchiri]
+- Update ona-oidc to v1.1.3
+  `PR #2766 <https://github.com/onaio/onadata/pull/2766>`
+  [@FrankApiyo]
+
+v4.11.1(2025-01-17)
+-------------------
+- Do not create export register when Instance is saved
+  `PR #2760 <https://github.com/onaio/onadata/pull/2760>`
+  [@kelvin-muchiri]
+
+v4.11.0(2025-01-14)
+-------------------
+- CSV export optimisation
+  `PR #2755 <https://github.com/onaio/onadata/pull/2755>`
+  [@kelvin-muchiri]
+- Add GeoJSON attachment params to EXPORT_OPTIONS
+  `PR #2757 <https://github.com/onaio/onadata/pull/2757>`
+  [@FrankApiyo]
+
+v4.10.1(2025-01-07)
+-------------------
+- Fix CSV import error for a form that defines Entities
+  `PR #2754 <https://github.com/onaio/onadata/pull/2754>`
+  [@kelvin-muchiri]
+- Security updates
+  `PR #2750 <https://github.com/onaio/onadata/pull/2750>`
+  [@kelvin-muchiri]
+
+v4.10.0(2024-12-02)
+--------------------
+- Add management command to restore soft deleted form
+  `PR #2744 <https://github.com/onaio/onadata/pull/2744>`
+  [@kelvin-muchiri]
+- fix: ensure xform GET query parameter is numeric
+  `PR #2743 <https://github.com/onaio/onadata/pull/2743>`
+  [@ukanga]
+- Check error message in response
+  `PR #2742 <https://github.com/onaio/onadata/pull/2742>`
+  [@ukanga]
+- fix: value error exception for non numeric project id
+  `PR #2741 <https://github.com/onaio/onadata/pull/2741>`
+  [@ukanga]
+- Delete bulk submissions asynchronously
+  `PR #2738 <https://github.com/onaio/onadata/pull/2738>`
+  [@kelvin-muchiri]
+
+v4.9.2(2024-11-18)
+------------------
+- Security updates
+  `PR #2729 <https://github.com/onaio/onadata/pull/2729>`
+  [@kelvin-muchiri]
+- Invalidate XForm list cache when form is published/replaced
+  `PR #2730 <https://github.com/onaio/onadata/pull/2730>`
+  [@kelvin-muchiri]
+- Update pre commit install instructions
+  `PR #2723 <https://github.com/onaio/onadata/pull/2723>`
+  [@kelvin-muchiri]
+- Update to oidc v1.1.2
+  `PR #2736 <https://github.com/onaio/onadata/pull/2736>`
+  [@ukanga]
+- Security updates
+  `PR #2737 <https://github.com/onaio/onadata/pull/2737>`
+  [@kelvin-muchiri]
+- Ensure geojson exports creation process is idempotent
+  `PR #2734 <https://github.com/onaio/onadata/pull/2734>`
+  [@FrankApiyo]
+- [fix] Lookup only models where the parent is h:head
+  `PR #2733 <https://github.com/onaio/onadata/pull/2733>`
+  [@ukanga]
+
+v4.9.1(2024-10-23)
+------------------
+- Fix extra columns excluded in DataView CSV export
+  `PR #2727 <https://github.com/onaio/onadata/pull/2727>`
+  [@kelvin-muchiri]
+- Remove deleted_by serializer field for Dataviews
+  `PR #2721 <https://github.com/onaio/onadata/pull/2721>`
+  [@FrankApiyo]
+
+v4.9.0(2024-10-22)
+------------------
+- Update pre-commit hooks
+  `PR #2717 <https://github.com/onaio/onadata/pull/2717>`
+  [@kelvin-muchiri]
+- Add/remove user from organization synchronously
+  `PR #2715 <https://github.com/onaio/onadata/pull/2715>`
+  [@kelvin-muchiri]
+- Redirect client to download media directly from Amazon S3 / Azure Storage
+  `PR #2713 <https://github.com/onaio/onadata/pull/2713>`
+  [@kelvin-muchiri]
+- Add organization email to organization profile instead of adding to organization user
+  `PR #2712 <https://github.com/onaio/onadata/pull/2712>`
+  [@FrankApiyo]
+- Disable sending of activation email when creating organization
+  `PR #2710 <https://github.com/onaio/onadata/pull/2710>`
+  [@kelvin-muchiri]
+
+v4.8.0(2024-09-23)
+------------------
+- Update ona-oidc version to 1.1.1
+  `PR #2708 <https://github.com/onaio/onadata/pull/2708>`
+  [@FrankApiyo]
+- Add support for OR operation data filter for date fields
+  `PR #2701 <https://github.com/onaio/onadata/pull/2704>`
+  [@kelvin-muchiri]
+
+v4.7.1(2024-09-16)
+------------------
+- Use chunked queryset when iterating queryset
+  `PR #2701 <https://github.com/onaio/onadata/pull/2701>`
+  [@kelvin-muchiri]
+
+v4.7.0(2024-09-16)
+------------------
+- Add logging to project view page: add why we get 400 in log
+  `PR #2699 <https://github.com/onaio/onadata/pull/2699>`
+  [@FrankApiyo]
+- Add missing model index changes
+  `PR #2697 <https://github.com/onaio/onadata/pull/2697>`
+  [@kelvin-muchiri]
+- Add index for logger_xform and logger_project deleted_at fields
+  `PR #2696 <https://github.com/onaio/onadata/pull/2696>`
+  [@FrankApiyo]
+- Pin submission post processing actions to master database
+  `PR #2694 <https://github.com/onaio/onadata/pull/2694>`
+  [@kelvin-muchiri]
+- Add config to disable user creation
+  `PR #2688 <https://github.com/onaio/onadata/pull/2688>`
+  [@ciremusyoka]
+- Add support for creating Entity via API
+  `PR #2683 <https://github.com/onaio/onadata/pull/2683>`
+  [@kelvin-muchiri]
+- Use eventual consistency to update EntityList num_entities
+  `PR #2651 <https://github.com/onaio/onadata/pull/2651>`
+  [@kelvin-muchiri]
+
+v4.6.0(2024-09-02)
+------------------
+- Cache xform list results
+  `PR #2692 <https://github.com/onaio/onadata/pull/2692>`
+  [@kelvin-muchiri]
+
+v4.5.2(2024-08-30)
+------------------
+- Add CustomScopedRateThrolle throttling class
+  `PR #2685 <https://github.com/onaio/onadata/pull/2689>`
+  [@FrankApiyo]
+
+v4.5.1(2024-08-30)
+------------------
+- Add throttle scopes for xform_list and xform_submission viewsets
+  `PR #2685 <https://github.com/onaio/onadata/pull/2685>`
+  [@FrankApiyo]
+
+v4.5.0(2024-08-28)
+------------------
+- Fix argument of type 'ProjectUserObjectPermission' is not iterable
+  `PR #2682 <https://github.com/onaio/onadata/pull/2682>`
+  [@kelvin-muchiri]
+- Updated docker file to use latest base images
+  `PR #2680 <https://github.com/onaio/onadata/pull/2680>`
+  [@ukanga]
+- Add support for downloading EntityList dataset
+  `PR #2678 <https://github.com/onaio/onadata/pull/2678>`
+  [@kelvin-muchiri]
+- Fix exception thrown when updating organization profile
+  `PR #2677 <https://github.com/onaio/onadata/pull/2677>`
+  [@FrankApiyo]
+- Create Entity only if submission is approved when form submission review is enabled
+  `PR #2673 <https://github.com/onaio/onadata/pull/2673>`
+  [@kelvin-muchiri]
+- docker: Use latest build of python-deps
+  `PR #2670 <https://github.com/onaio/onadata/pull/2670>`
+  [@ukanga]
+- Fix stale data sent to rest services after editing submission
+  `PR #2667 <https://github.com/onaio/onadata/pull/2667>`
+  [@kelvin-muchiri]
+- Add ability to have configurable Django admin path
+  `PR #2666 <https://github.com/onaio/onadata/pull/2666>`
+  [@kelvin-muchiri]
+- User per-role cache key for the organization_profile_viewset
+  `PR #2665 <https://github.com/onaio/onadata/pull/2665>`
+  [@FrankApiyo]
+
+v4.4.0(2024-08-13)
+------------------
+- Fix untracked Django's view of migration state
+  `PR #2663 <https://github.com/onaio/onadata/pull/2663>`
+  [@kelvin-muchiri]
+- Convert Entities docs from markdown into restructured text format
+  `PR #2662 <https://github.com/onaio/onadata/pull/2662>`
+  [@kelvin-muchiri]
+- Handle exceptions from running migrations
+  `PR #2661 <https://github.com/onaio/onadata/pull/2661>`
+  [@kelvin-muchiri]
+- Add ability to delete Entities in bulk
+  `PR #2660 <https://github.com/onaio/onadata/pull/2660>`
+  [@kelvin-muchiri]
+- Add Entities documentation to Sphinx table of contents tree
+  `PR #2659 <https://github.com/onaio/onadata/pull/2659>`
+  [@kelvin-muchiri]
+- Patch update django, sqlparse and certifi packages
+  `PR #2657 <https://github.com/onaio/onadata/pull/2657>`
+  [@KipSigei]
+
+v4.3.4(2024-07-29)
+------------------
+- Entities search
+  `PR #2643 <https://github.com/onaio/onadata/pull/2643>`
+  [@kelvin-muchiri]
+- Optimize updates to project `date_modified` field when submitting data
+  `PR #2642 <https://github.com/onaio/onadata/pull/2642>`
+  [@KipSigei]
+- Add support for defining Entity properties within grouped sections
+  `PR #2644 <https://github.com/onaio/onadata/pull/2644>`
+  [@kelvin-muchiri]
+- Remove default ordering on XForm, Attachment model
+  `PR #2645 <https://github.com/onaio/onadata/pull/2645>`
+  [@kelvin-muchiri]
+- Cache XForm manifest data
+  `PR #2646 <https://github.com/onaio/onadata/pull/2646>`
+  [@kelvin-muchiri]
+- Exclude deleted Entities from form's manifest data by
+  `PR #2648 <https://github.com/onaio/onadata/pull/2648>`
+  [@kelvin-muchiri]
+- Add email field to the organization serializer
+  `PR #2647 <https://github.com/onaio/onadata/pull/2647>`
+  [@FrankApiyo]
+- Use actual User, Group instances in migration file
+  `PR #2655 <https://github.com/onaio/onadata/pull/2655>`
+  [@kelvin-muchiri]
+
+v4.3.3(2024-07-10)
+------------------
+- Add Entity related data to forms on project retrieve endpoint
+  `PR #2639 <https://github.com/onaio/onadata/pull/2639>`
+  [@kelvin-muchiri]
+- Ignore EntityList model permissions on API endpoints
+  `PR #2635 <https://github.com/onaio/onadata/pull/2635>`
+  [@kelvin-muchiri]
+- Docs update
+  `PR #2629 <https://github.com/onaio/onadata/pull/2629>`
+  [@ukanga]
+- Make pending migrations
+  `PR #2632 <https://github.com/onaio/onadata/pull/2632>`
+  [@kelvin-muchiri]
+- Check attempts is truthy before int comparison
+  `PR #2618 <https://github.com/onaio/onadata/pull/2618>`
+  [@ukanga]
+- Tune migration performance
+  `PR #2631 <https://github.com/onaio/onadata/pull/2631>`
+  [@kelvin-muchiri]
+
+v4.3.2(2024-07-02)
+------------------
+- Security Updates
+  `PR #2624 <https://github.com/onaio/onadata/pull/2624>`
+  [@KipSigei]
+- Cleanup github action yaml file
+  `PR #2627 <https://github.com/onaio/onadata/pull/2627>`
+  [@ukanga]
+
+v4.3.1(2024-06-28)
+------------------
+- Fix 0 integer, decimal values parsed as string when saving json
+  `PR #2621 <https://github.com/onaio/onadata/pull/2621>`
+  [@kelvin-muchiri]
+
+v4.3.0(2024-06-26)
+------------------
+- Separate ecr image build to use arm64 runner for arm64 builds
+  `PR #2620 <https://github.com/onaio/onadata/pull/2620>`
+  [@kelvin-muchiri]
+- Add Entity updates
+  `PR #2592 <https://github.com/onaio/onadata/pull/2592>`
+  [@kelvin-muchiri]
+- Update messaging endpoint docs
+  `PR #2616 <https://github.com/onaio/onadata/pull/2616>`
+  [@KipSigei]
+- Fix ValueError for User instance primary key in password validation
+  `PR #2613 <https://github.com/onaio/onadata/pull/2613>`
+  [@KipSigei]
+
+v4.2.2(2024-06-06)
+------------------
+- Add support for merged dataset geojson format on endpoint /api/v1/data/<form_id>
+  `PR #2608 <https://github.com/onaio/onadata/pull/2608>`
+  [@kelvin-muchiri]
+
+v4.2.1(2024-06-04)
+------------------
+- Update Metadata action to capture tags
+  `PR #2610 <https://github.com/onaio/onadata/pull/2610>`
+  [@KipSigei]
+
+v4.2.0(2024-06-03)
+------------------
+- Add support for Entities
+  `PR #2504 <https://github.com/onaio/onadata/pull/2504>`
+  [@kelvin-muchiri]
+- Optimize attachment xform migration
+  `PR #2599 <https://github.com/onaio/onadata/pull/2599>`
+  [@kelvin-muchiri]
+- Fix exception thrown when deleting export
+  `PR #2600 <https://github.com/onaio/onadata/pull/2600>`
+  [@kelvin-muchiri]
+- Fix merged dataset permissions not applied on share
+  `PR #2598 <https://github.com/onaio/onadata/pull/2598>`
+  [@kelvin-muchiri]
+- Rebuild docker image with pyenv and on Ubuntu 22.04 runtime image.
+  `PR #2597 <https://github.com/onaio/onadata/pull/2597>`
+  [@ukanga]
+- Set permissions for merged dataset asynchronously
+  `PR #2600 <https://github.com/onaio/onadata/pull/2600>`
+  [@kelvin-muchiri]
+
+v4.1.0(2024-05-03)
+------------------
+- Fix API docs not created when building image
+  `PR #2589 <https://github.com/onaio/onadata/pull/2589>`
+  [@kelvin-muchiri]
+- Add xform to attachment model
+  `PR #2587 <https://github.com/onaio/onadata/pull/2587>`
+  [@ukanga]
+
+v4.0.1(2024-04-15)
+------------------
+- When an odk token expires is None, deactivate and replace
+  `PR #2583 <https://github.com/onaio/onadata/pull/2583>`
+  [@FrankApiyo]
+- Flatten select multiples in repeating sections during CSV import
+  `PR #2578 <https://github.com/onaio/onadata/pull/2578>`
+  [@kelvin-muchiri]
+
+v4.0.0(2024-04-08)
+------------------
+- Remove redundant Dockerfile used for development
+  `PR #2575 <https://github.com/onaio/onadata/pull/2575>`
+  [@kelvin-muchiri]
+- Add user to organization asynchronously
+  `PR #2574 <https://github.com/onaio/onadata/pull/2574>`
+  [@kelvin-muchiri]
+- Upgrade to Django 4.2
+  `PR #2572 <https://github.com/onaio/onadata/pull/2572>`
+  [@ukanga]
+
+v3.19.0(2024-03-26)
+-------------------
+- Security Remediations
+  `PR #2569 <https://github.com/onaio/onadata/pull/2569>`
+  [@KipSigei]
+- Add Instance History indexing to checksum & uuid fields
+  `PR #2564 <https://github.com/onaio/onadata/pull/2564>`
+  [@KipSigei]
+- Add migration to update old enketo urls
+  `PR #2552 <https://github.com/onaio/onadata/pull/2552>`
+  [@ciremusyoka]
+- Ignore child questions of grouped sections within repeating sections during CSV export
+  `PR #2559 <https://github.com/onaio/onadata/pull/2559>`
+  [@kelvin-muchiri]
+
+v3.18.2(2024-02-23)
+-------------------
+- Improve perfomance of /status endpoint
+  `PR #2551 <https://github.com/onaio/onadata/pull/2558>`
+  [@FrankApiyo]
+
+v3.18.1(2024-02-21)
+-------------------
+- Fix bug invalid endpoint when fetching media files
+  `PR #2551 <https://github.com/onaio/onadata/pull/2551>`
+  [@kelvin-muchiri]
+
+v3.18.0(2024-02-05)
+-------------------
+- Fix SQL syntax error when grouping by select one
+  `PR #2549 <https://github.com/onaio/onadata/pull/2549>`
+  [@KipSigei]
+- Process Instance metadata from light tasks synchronously
+  `PR #2547 <https://github.com/onaio/onadata/pull/2547>`
+  [@kelvin-muchiri]
+
+v3.17.3(2024-01-15)
+-------------------
+- Explicitly set AWS_S3_ENDPOINT_URL in boto3 configs
+  `PR #2540 <https://github.com/onaio/onadata/pull/2540>`
+  [@KipSigei]
+
+v3.17.2(2023-12-18)
+-------------------
+- Security Updates
+  `PR #2529 <https://github.com/onaio/onadata/pull/2529>`
+  [@KipSigei]
+- Enable Token Authentication on Form List API
+  `PR #2525 <https://github.com/onaio/onadata/pull/2525>`
+  [@KipSigei]
+- Set AWS credentials when generating pre-signed URLS
+  `PR #2527 <https://github.com/onaio/onadata/pull/2527>`
+  [@ukanga]
+
+v3.17.1(2023-12-11)
+-------------------
+- Enable TokenAuthentication on briefcase viewset
+  `PR #2523 <https://github.com/onaio/onadata/pull/2523>`
+  [@KipSigei]
+- Fix stale data sent to RapidPro when asynchronous processing of submissions is enabled
+  `PR #2522 <https://github.com/onaio/onadata/pull/2522>`
+  [@kelvin-muchiri]
+
+v3.17.0(2023-11-24)
+-------------------
+- Create Composite Index for xform_id and id fields
+  `PR #2519 <https://github.com/onaio/onadata/pull/2519>`
+  [@KipSigei]
+- Filter out soft-deleted xforms from project forms endpoint
+  `PR #2515 <https://github.com/onaio/onadata/pull/2515>`
+  [@KipSigei]
+- Check length of paginated instances in briefcase viewset
+  `PR #2517 <https://github.com/onaio/onadata/pull/2517>`
+  [@KipSigei]
+
+v3.16.0(2023-11-23)
+-------------------
+- Add custom template tag: settings_value
+  `PR #2510 <https://github.com/onaio/onadata/pull/2510>`
+  [@FrankApiyo]
+- Enhancement: Handle Statement Timeout in Briefcase Viewset
+  `PR #2508 <https://github.com/onaio/onadata/pull/2508>`
+  [@KipSigei]
+- Trigger database call to correctly capture OperationalError
+  `PR #2513 <https://github.com/onaio/onadata/pull/2513>`
+  [@KipSigei]
+- Upgrade Django for omitted requirements files
+  `PR #2512 <https://github.com/onaio/onadata/pull/2512>`
+  [@kelvin-muchiri]
+
+v3.15.0(2023-11-17)
+-------------------
+- Upgrade Django to version 3.2.23
+  `PR #2507 <https://github.com/onaio/onadata/pull/2507>`
+  [@kelvin-muchiri]
+- Custom project invitation template
+  `PR #2506 <https://github.com/onaio/onadata/pull/2506>`
+  [@kelvin-muchiri]
+- Soft delete xform from legacy UI
+  `PR #2506 <https://github.com/onaio/onadata/pull/2503>`
+  [@FrankApiyo]
+
+v3.14.4(2023-11-07)
+-------------------
+- Bump oidc version to v1.0.3
+  `PR #2501 <https://github.com/onaio/onadata/pull/2501>`
+  [@kelvin-muchiri]
+- Improve performance for attachments xform meta permissions check
+  `PR #2499 <https://github.com/onaio/onadata/pull/2499>`
+  [@KipSigei]
+- Create user auth token if doesn't exist upon retrieval
+  `PR #2496 <https://github.com/onaio/onadata/pull/2496>`
+  [@ciremusyoka]
+
+v3.14.3(2023-10-30)
+-------------------
+- Stream response on endpoint /<username>/xformsManifest/<form_id>
+  `PR #2493 <https://github.com/onaio/onadata/pull/2493>`
+  [@kelvin-muchiri]
+- Allow only authenticated users with correct permissions to download media
+  `PR #2492 <https://github.com/onaio/onadata/pull/2492>`
+  [@KipSigei]
+
+v3.14.2(2023-10-19)
+-------------------
+- Gracefully handle empty geoshapes and geotraces in data
+  `PR #2489 <https://github.com/onaio/onadata/pull/2489>`
+  [@KipSigei]
+- Save XML to JSON data in pre-save
+  `PR #2486 <https://github.com/onaio/onadata/pull/2486>`
+  [@kelvin-muchiri]
+
+v3.14.1(2023-10-09)
+-------------------
+- Rebuilding to pick the latest google export changes.
+  [@kelvin-muchiri]
+
+v3.14.0(2023-10-02)
+-------------------
+- Ensure sas token is appended to azure blob attachment url
+  `PR #2482 <https://github.com/onaio/onadata/pull/2482>`
+  [@KipSigei]
+- Ensure geotrace and geoshape in repeats is included in GeoJSON data endpoint
+  `PR #2478 <https://github.com/onaio/onadata/pull/2478>`
+  [@KipSigei]
+- Data endpoint enhancements
+  `PR #2477 <https://github.com/onaio/onadata/pull/2477>`
+  [@kelvin-muchiri]
+
+v3.13.1(2023-09-13)
+-------------------
+- Revert to have data exports default sorting by id
+  `PR #2474 <https://github.com/onaio/onadata/pull/2474>`
+  [@kelvin-muchiri]
+
+v3.13.0(2023-09-04)
+-------------------
+- Add project and form level odk submission-list and download endpoints
+  `PR #2451 <https://github.com/onaio/onadata/pull/2451>`
+  [@KipSigei]
+- Fix async submission count discrepancy
+  `PR #2469 <https://github.com/onaio/onadata/pull/2469>`
+  [@KipSigei]
+
+v3.12.2(2023-08-24)
+-------------------
+- Solve intermittent bug where form permissions are not applied for new forms
+  `PR #2470 <https://github.com/onaio/onadata/pull/2470>`
+  [@kelvin-muchiri]
+- Enhance performance when exporting data on endpoint api/v1/data/<form_id>.<format>
+  `PR #2460 <https://github.com/onaio/onadata/pull/2460>`
+  [@kelvin-muchiri]
+
+v3.12.1(2023-08-14)
+-------------------
+
+- Fix pagination on endpoint /api/v2/open-data/<id>/data returning duplicates
+  `PR #2467 <https://github.com/onaio/onadata/pull/2467>`
+  [@kelvin-muchiri]
+- Update dependencies
+  `PR @2466 <https://github.com/onaio/onadata/pull/2466>`
+  [@KipSigei]
+- Fix attribute error when uploading xls datasets
+  `PR #2465 <https://github.com/onaio/onadata/pull/2465>`
+  [@FrankApiyo]
+
+v3.12.0(2023-08-07)
+-------------------
+
+- Add indexes to instance model date fields
+  `PR #2393 <https://github.com/onaio/onadata/pull/2393>`
+  [@KipSigei]
+
+v3.11.0(2023-07-28)
+-------------------
+
+- Ensure onadata can work in a multi-domain setup
+  `PR #2450 <https://github.com/onaio/onadata/pull/2450>`
+  [@FrankApiyo]
+- Fix AttributeError: 'ExportBuilder' object has no attribute 'to_google_sheets'
+  `PR #2458 <https://github.com/onaio/onadata/pull/2458>`
+  [@kelvin-muchiri]
+- Enhance performance of open-data endpoint api/v2/open-data/<uuid>/data
+  `PR #2456 <https://github.com/onaio/onadata/pull/2456>`
+  [@kelvin-muchiri]
+- Fix AttributeError: 'NoneType' object has no attribute 'strip' when exporting form data
+  `PR #2453 <https://github.com/onaio/onadata/pull/2453>`
+  [@kelvin-muchiri]
+- Add ability to create, update project invitations
+  `PR #2430 <https://github.com/onaio/onadata/pull/2430>`
+  [@kelvin-muchiri]
+
+v3.10.1(2023-07-20)
+-------------------
+
+- Upgrade django to v3.2.20
+  `PR #2454 <https://github.com/onaio/onadata/pull/2454>`
+  [@KipSigei]
+- Optimize attachments endpoint
+  `PR #2452 <https://github.com/onaio/onadata/pull/2452>`
+  [@KipSigei]
+
+v3.10.0(2023-07-03)
+-------------------
+
+- Add task to permanently delete soft-deleted submissiions
+  `PR #2446 <https://github.com/onaio/onadata/pull/2446>`
+  [@KipSigei]
+- Update sqlparse package to fix security vulnerability
+  `PR #2447 <https://github.com/onaio/onadata/pull/2447>`
+  [@KipSigei]
+- Add ability to permanently delete submissions
+  `PR #2437 <https://github.com/onaio/onadata/pull/2437>`
+  [@KipSigei]
+- Update pyxform version to v1.12.0 with case management support
+  `PR #2341 <https://github.com/onaio/onadata/pull/2341>`
+  [@KipSigei]
+
+v3.9.2(2023-06-19)
+------------------
+
+- Fix open-data endpoint timeout bug
+  `PR #2435 <https://github.com/onaio/onadata/pull/2435>`
+  [@kelvin-muchiri]
+
+v3.9.1(2023-06-07)
+------------------
+
+- Add configurable timeouts for webhook requests
+  `PR #2419 <https://github.com/onaio/onadata/pull/2419>`
+  [@DavisRayM]
+- Handle AttributeError returned when element is None
+  `PR #2421 <https://github.com/onaio/onadata/pull/2421>`
+  [@DavisRayM]
+- Fix xlsx export bug on UI
+  `PR #2426 <https://github.com/onaio/onadata/pull/2426>`
+  [@KipSigei]
+- Fix unbound local error exception
+  `PR #2428 <https://github.com/onaio/onadata/pull/2428>`
+  [@KipSigei]
+- Upgrade django to v3.2.19
+  `PR #2429 <https://github.com/onaio/onadata/pull/2429>`
+  [@KipSigei]
+
 v3.9.0(2023-05-02)
 -----------------
 
@@ -167,7 +842,7 @@ v3.6.0(2022-10-31)
 
 v3.5.0(2022-10-06)
 ------------------
-- Fix org members permissions 
+- Fix org members permissions
   `PR #2323 <https://github.com/onaio/onadata/pull/2323>`_
   [@KipSigei]
 - Add pagination to projects endpoint
@@ -282,19 +957,19 @@ v3.1.0(2022-07-08)
 v3.0.4(2022-06-14)
 ------------------
 
-- Add geojson simplestyle-spec support 
+- Add geojson simplestyle-spec support
   `PR #2255 <https://github.com/onaio/onadata/pull/2255>`_
   [@KipSigei]
-- Fix data type of filtered /data JSON response 
+- Fix data type of filtered /data JSON response
   `PR #2256 <https://github.com/onaio/onadata/pull/2256>`_
   [@ukanga]
-- Use xlsx file object instead of absolute path 
+- Use xlsx file object instead of absolute path
   `PR #2257 <https://github.com/onaio/onadata/pull/2257>`_
   [@KipSigei]
-- Add netcat to allow liveness/readiness probes that make use of open port checks. 
+- Add netcat to allow liveness/readiness probes that make use of open port checks.
   `PR #2259 <https://github.com/onaio/onadata/pull/2259>`_
   [@ukanga]
-- Fix netcat package include in Dockerfile 
+- Fix netcat package include in Dockerfile
   `PR #2260 <https://github.com/onaio/onadata/pull/2260>`_
   [@ukanga]
 
@@ -595,7 +1270,7 @@ v2.5.6(2021-06-02)
 v2.5.5(2021-05-17)
 ------------------
 
-- Add documentation for the messaging endpoint 
+- Add documentation for the messaging endpoint
   `PR #2026 <https://github.com/onaio/onadata/pull/2026>`_
   [@DavisRayM]
 - Fix submission deletion endpoint error

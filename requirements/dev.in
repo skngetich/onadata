@@ -2,15 +2,15 @@
 -r base.in
 
 django-extensions
+flaky
+httmock
 ipdb
+isort
+moto
+pre-commit
+prospector>=1.10.3
 pylint
 pylint-django
-yapf
-isort
-prospector
-httmock
-mock
 requests_mock
 tblib
-flake8
-flaky
+yapf

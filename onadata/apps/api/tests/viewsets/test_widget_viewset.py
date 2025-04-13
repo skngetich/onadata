@@ -2,22 +2,20 @@
 """
 Test /widgets API endpoint implementation.
 """
-import os
 import json
+import os
 
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 
-from onadata.apps.logger.models.widget import Widget
 from onadata.apps.api.tests.viewsets.test_abstract_viewset import TestAbstractViewSet
-from onadata.apps.api.viewsets.widget_viewset import WidgetViewSet
-from onadata.libs.permissions import ReadOnlyRole
-from onadata.libs.permissions import DataEntryOnlyRole
-from onadata.libs.permissions import OwnerRole
 from onadata.apps.api.tools import get_or_create_organization_owners_team
 from onadata.apps.api.viewsets.organization_profile_viewset import (
     OrganizationProfileViewSet,
 )
+from onadata.apps.api.viewsets.widget_viewset import WidgetViewSet
+from onadata.apps.logger.models.widget import Widget
+from onadata.libs.permissions import DataEntryOnlyRole, OwnerRole, ReadOnlyRole
 
 
 # pylint: disable=too-many-public-methods
@@ -217,11 +215,17 @@ class TestWidgetViewSet(TestAbstractViewSet):
             }
         )
 
+        # empty - no xform filter
         request = self.factory.get("/", **self.extra)
         response = view(request)
-
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(len(response.data), 2)
+        self.assertEqual(len(response.data), 0)
+
+        # not empty - xform filter
+        request = self.factory.get("/", data={"xform": self.xform.pk}, **self.extra)
+        response = view(request)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data), 1)
 
     def test_widget_permission_create(self):
 
@@ -313,7 +317,7 @@ class TestWidgetViewSet(TestAbstractViewSet):
         )
 
         request = self.factory.get("/", **self.extra)
-        response = view(request)
+        response = view(request, formid=self.xform.pk)
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.data), 0)
@@ -322,8 +326,7 @@ class TestWidgetViewSet(TestAbstractViewSet):
         ReadOnlyRole.add(self.user, self.xform)
 
         request = self.factory.get("/", **self.extra)
-        response = view(request)
-
+        response = view(request, formid=self.xform.pk)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.data), 1)
 
@@ -498,7 +501,6 @@ class TestWidgetViewSet(TestAbstractViewSet):
 
         request = self.factory.get("/", **self.extra)
         response = view(request, formid=self.xform.pk)
-
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.data), 1)
 

@@ -17,7 +17,7 @@ from rest_framework.viewsets import ModelViewSet
 
 from onadata.apps.api import permissions
 from onadata.apps.api.models.organization_profile import OrganizationProfile
-from onadata.apps.api.tools import get_baseviewset_class
+from onadata.apps.api.tools import get_baseviewset_class, get_org_profile_cache_key
 from onadata.libs.filters import (
     OrganizationPermissionFilter,
     OrganizationsSharedWithUserFilter,
@@ -30,7 +30,7 @@ from onadata.libs.serializers.organization_member_serializer import (
     OrganizationMemberSerializer,
 )
 from onadata.libs.serializers.organization_serializer import OrganizationSerializer
-from onadata.libs.utils.cache_tools import ORG_PROFILE_CACHE, safe_delete
+from onadata.libs.utils.cache_tools import safe_delete
 from onadata.libs.utils.common_tools import merge_dicts
 
 BaseViewset = get_baseviewset_class()
@@ -65,12 +65,12 @@ class OrganizationProfileViewSet(
 
     def retrieve(self, request, *args, **kwargs):
         """Get organization from cache or db"""
-        username = kwargs.get("user")
-        cached_org = cache.get(f"{ORG_PROFILE_CACHE}{username}")
+        cache_key = get_org_profile_cache_key(request.user, self.get_object())
+        cached_org = cache.get(cache_key)
         if cached_org:
             return Response(cached_org)
         response = super().retrieve(request, *args, **kwargs)
-        cache.set(f"{ORG_PROFILE_CACHE}{username}", response.data)
+        cache.set(cache_key, response.data)
         return response
 
     def create(self, request, *args, **kwargs):
@@ -78,20 +78,22 @@ class OrganizationProfileViewSet(
         response = super().create(request, *args, **kwargs)
         organization = response.data
         username = organization.get("org")
-        cache.set(f"{ORG_PROFILE_CACHE}{username}", organization)
+        organization_profile = OrganizationProfile.objects.get(user__username=username)
+        cache_key = get_org_profile_cache_key(request.user, organization_profile)
+        cache.set(cache_key, organization)
         return response
 
     def destroy(self, request, *args, **kwargs):
         """Clear cache and destroy organization"""
-        username = kwargs.get("user")
-        safe_delete(f"{ORG_PROFILE_CACHE}{username}")
+        cache_key = get_org_profile_cache_key(request.user, self.get_object())
+        safe_delete(cache_key)
         return super().destroy(request, *args, **kwargs)
 
     def update(self, request, *args, **kwargs):
         """Update org in cache and db"""
-        username = kwargs.get("user")
         response = super().update(request, *args, **kwargs)
-        cache.set(f"{ORG_PROFILE_CACHE}{username}", response.data)
+        cache_key = get_org_profile_cache_key(request.user, self.get_object())
+        cache.set(cache_key, response.data)
         return response
 
     @action(methods=["DELETE", "GET", "POST", "PUT"], detail=True)
@@ -113,17 +115,12 @@ class OrganizationProfileViewSet(
 
         serializer = OrganizationMemberSerializer(data=data)
 
-        username = kwargs.get("user")
-        if serializer.is_valid():
-            serializer.save()
-            organization = serializer.validated_data.get("organization")
-            data = OrganizationSerializer(
-                organization, context={"request": request}
-            ).data
-            cache.set(f"{ORG_PROFILE_CACHE}{username}", data)
-        else:
+        if not serializer.is_valid():
             return Response(data=serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
+        serializer.save()
+
+        data = self.serializer_class(organization, context={"request": request}).data
         # pylint: disable=attribute-defined-outside-init
         self.etag_data = json.dumps(data)
         resp_status = (

@@ -4,9 +4,10 @@ Onadata django application, provides ODK Aggregate Server APIs,
 ODK Briefcase API and a REST API to manage data analysis, collection and
 visualization.
 """
+
 from __future__ import absolute_import, unicode_literals
 
-__version__ = "3.9.0"
+__version__ = "5.0.1"
 
 
 # This will make sure the app is always imported when

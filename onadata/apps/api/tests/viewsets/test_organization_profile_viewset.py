@@ -2,18 +2,21 @@
 """
 Test /orgs API endpoint implementation.
 """
+
 import json
 from builtins import str as text
+from unittest.mock import patch
 
-from django.contrib.auth.models import User, timezone
+from django.contrib.auth.models import AnonymousUser, User, timezone
 from django.core.cache import cache
+from django.test.utils import override_settings
 
 from guardian.shortcuts import get_perms
-from mock import patch
 from rest_framework import status
 
 from onadata.apps.api.models.organization_profile import (
     OrganizationProfile,
+    Team,
     get_organization_members_team,
 )
 from onadata.apps.api.tests.viewsets.test_abstract_viewset import TestAbstractViewSet
@@ -28,8 +31,12 @@ from onadata.apps.api.viewsets.project_viewset import ProjectViewSet
 from onadata.apps.api.viewsets.user_profile_viewset import UserProfileViewSet
 from onadata.apps.logger.models.project import Project
 from onadata.apps.main.models import UserProfile
-from onadata.libs.permissions import DataEntryRole, OwnerRole, EditorRole
-from onadata.libs.utils.cache_tools import PROJ_OWNER_CACHE, PROJ_PERM_CACHE, PROJ_TEAM_USERS_CACHE
+from onadata.libs.permissions import DataEntryRole, OwnerRole
+from onadata.libs.utils.cache_tools import (
+    PROJ_OWNER_CACHE,
+    PROJ_PERM_CACHE,
+    PROJ_TEAM_USERS_CACHE,
+)
 
 
 # pylint: disable=too-many-public-methods
@@ -83,6 +90,7 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
         self.assertNotEqual(response.get("Cache-Control"), None)
         self.assertEqual(response.status_code, 200)
         del self.company_data["metadata"]
+        del self.company_data["email"]
         self.assertEqual(response.data, [self.company_data])
 
         # inactive organization
@@ -107,6 +115,7 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
         self.assertNotEqual(response.get("Cache-Control"), None)
         self.assertEqual(response.status_code, 200)
         del self.company_data["metadata"]
+        del self.company_data["email"]
         self.assertEqual(response.data, [self.company_data])
 
     def test_orgs_list_shared_with_user(self):
@@ -188,6 +197,8 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
         response = view(request, user="denoinc")
         self.assertNotEqual(response.get("Cache-Control"), None)
         self.assertEqual(response.status_code, 200)
+        del self.company_data["email"]
+        del self.company_data["metadata"]
         self.assertEqual(response.data, self.company_data)
         self.assertIn("users", list(response.data))
         for user in response.data["users"]:
@@ -201,6 +212,8 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
         response = view(request, user="denoinc")
         self.assertNotEqual(response.get("Cache-Control"), None)
         self.assertEqual(response.status_code, 200)
+        del self.company_data["email"]
+        del self.company_data["metadata"]
         self.assertEqual(response.data, self.company_data)
         self.assertIn("users", list(response.data))
         for user in response.data["users"]:
@@ -210,12 +223,14 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
     def test_orgs_create(self):
         self._org_create()
         self.assertTrue(self.organization.user.is_active)
+        self.assertEqual(self.organization.email, "mail@mail-server.org")
 
     def test_orgs_create_without_name(self):
         data = {
             "org": "denoinc",
             "city": "Denoville",
             "country": "US",
+            "email": "user@mail.org",
             "home_page": "deno.com",
             "twitter": "denoinc",
             "description": "",
@@ -228,6 +243,29 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
         )
         response = self.view(request)
         self.assertEqual(response.data, {"name": ["This field is required."]})
+
+    def test_org_create_and_fetch_by_admin_user(self):
+        org_email = "mail@mail-sever.org"
+        data = {
+            "name": "denoinc",
+            "org": "denoinc",
+            "city": "Denoville",
+            "country": "US",
+            "home_page": "deno.com",
+            "twitter": "denoinc",
+            "email": org_email,
+            "description": "",
+            "address": "",
+            "phonenumber": "",
+            "require_auth": False,
+        }
+        request = self.factory.post(
+            "/", data=json.dumps(data), content_type="application/json"
+        )
+        request.user = self.user
+        response = self.view(request)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["email"], org_email)
 
     def test_org_create_with_anonymous_user(self):
         data = {
@@ -292,6 +330,8 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
         response = view(request, user="denoinc")
         self.assertEqual(response.status_code, 201)
         self.assertEqual(set(response.data), set(["denoinc", "aboy"]))
+        team = Team.objects.get(name=f"{self.organization.user.username}#members")
+        self.assertTrue(team.user_set.filter(username="aboy").exists())
 
     def test_inactive_members_not_listed(self):
         self._org_create()
@@ -381,6 +421,7 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
             }
         )
         del expected_data["metadata"]
+        del expected_data["email"]
 
         request = self.factory.get("/", **self.extra)
         response = view(request)
@@ -412,6 +453,7 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
         request = self.factory.get("/", **self.extra)
         response = view(request, user="denoinc")
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["email"], "mail@mail-server.org")
         self.assertIn("users", list(response.data))
 
         for user in response.data["users"]:
@@ -423,6 +465,21 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
                 else user_role
             )
             self.assertEqual(role, expected_role)
+
+        # getting profile as a member
+        request = self.factory.get("/", **self.extra)
+        request.user = User.objects.get(username="aboy")
+        response = view(request, user="denoinc")
+        self.assertEqual(response.status_code, 200)
+
+        # get profile as a anonymous user
+        request = self.factory.get("/", **self.extra)
+        request.user = AnonymousUser()
+        request.headers = None
+        request.META["HTTP_AUTHORIZATION"] = ""
+        response = view(request, user="denoinc")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse("email" in response.data)
 
     def test_add_members_to_org_with_anonymous_user(self):
         self._org_create()
@@ -553,6 +610,7 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
             "home_page": "deno.com",
             "twitter": "denoinc",
             "description": "",
+            "email": "user@mail.com",
             "address": "",
             "phonenumber": "",
             "require_auth": False,
@@ -676,6 +734,7 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
         response = view(request, user="denoinc")
         self.assertEqual(response.status_code, 400)
 
+    @override_settings(DEFAULT_FROM_EMAIL="noreply@ona.io")
     @patch("onadata.libs.serializers.organization_member_serializer.send_mail")
     def test_add_members_to_org_email(self, mock_email):
         self._org_create()
@@ -700,6 +759,7 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
         )
         self.assertEqual(set(response.data), set(["denoinc", "aboy"]))
 
+    @override_settings(DEFAULT_FROM_EMAIL="noreply@ona.io")
     @patch("onadata.libs.serializers.organization_member_serializer.send_mail")
     def test_add_members_to_org_email_custom_subj(self, mock_email):
         self._org_create()
@@ -750,8 +810,13 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
         request = self.factory.get("/", **self.extra)
         response = view(request, user="denoinc")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["users"][2]["user"], "aboy")
-        self.assertEqual(response.data["users"][2]["role"], "editor")
+        # items can be in any order
+        self.assertTrue(
+            any(
+                item["user"] == "aboy" and item["role"] == "editor"
+                for item in response.data["users"]
+            )
+        )
 
     def test_add_members_to_owner_role(self):
         self._org_create()
@@ -776,8 +841,13 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
         request = self.factory.get("/", **self.extra)
         response = view(request, user="denoinc")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["users"][1]["user"], "aboy")
-        self.assertEqual(response.data["users"][1]["role"], "owner")
+        aboy_data = {"user": "aboy", "role": "owner"}
+        self.assertTrue(
+            any(  # Order doesn't matter. aboy can be first or last
+                all(item.get(key) == value for key, value in aboy_data.items())
+                for item in response.data["users"]
+            )
+        )
 
         owner_team = get_or_create_organization_owners_team(self.organization)
 
@@ -796,12 +866,19 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
 
         self.assertNotIn(aboy, owner_team.user_set.all())
 
+    @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
     def test_org_members_added_to_projects(self):
         # create org
         self._org_create()
         view = OrganizationProfileViewSet.as_view(
             {"post": "members", "get": "retrieve", "put": "members"}
         )
+        # create a proj
+        project_data = {"owner": self.company_data["user"]}
+        self._project_create(project_data)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self._publish_xls_form_to_project()
 
         # create aboy
         self.profile_data["username"] = "aboy"
@@ -809,15 +886,13 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
 
         data = {"username": "aboy", "role": "owner"}
         request = self.factory.post(
-            "/", data=json.dumps(data), content_type="application/json", **self.extra
+            "/",
+            data=json.dumps(data),
+            content_type="application/json",
+            **self.extra,
         )
         response = view(request, user="denoinc")
         self.assertEqual(response.status_code, 201)
-
-        # create a proj
-        project_data = {"owner": self.company_data["user"]}
-        self._project_create(project_data)
-        self._publish_xls_form_to_project()
 
         # create alice
         self.profile_data["username"] = "alice"
@@ -833,6 +908,8 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
         self.assertEqual(response.status_code, 201)
 
         # Assert that user added in org is added to teams in proj
+        aboy.refresh_from_db()
+        alice.refresh_from_db()
         self.assertTrue(OwnerRole.user_has_role(aboy, self.project))
         self.assertTrue(OwnerRole.user_has_role(alice, self.project))
         self.assertTrue(OwnerRole.user_has_role(aboy, self.xform))
@@ -888,7 +965,7 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
         )
         response = view(request, user="denoinc")
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.data, ["denoinc", "aboy"])
+        self.assertCountEqual(response.data, ["denoinc", "aboy"])
 
         project_view = ProjectViewSet.as_view({"get": "retrieve"})
         request = self.factory.get(
@@ -987,8 +1064,8 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
     def test_update_org_name(self):
         self._org_create()
 
-        # update name
-        data = {"name": "Dennis2"}
+        # update name and email
+        data = {"name": "Dennis2", "email": "dennis@mail.com"}
         request = self.factory.patch("/", data=data, **self.extra)
         response = self.view(request, user="denoinc")
         self.assertEqual(response.data["name"], "Dennis2")
@@ -1128,7 +1205,7 @@ class TestOrganizationProfileViewSet(TestAbstractViewSet):
         response = view(request, user="denoinc")
         expected_results = ["denoinc", "alice"]
         self.assertEqual(status.HTTP_201_CREATED, response.status_code)
-        self.assertEqual(expected_results, response.data)
+        self.assertCountEqual(expected_results, response.data)
 
         self._login_user_and_profile(extra_post_data=alice_data)
 

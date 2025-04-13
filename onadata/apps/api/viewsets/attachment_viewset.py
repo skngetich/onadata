@@ -2,9 +2,11 @@
 """
 The /api/v1/attachments API implementation.
 """
+
 from django.conf import settings
 from django.core.files.storage import default_storage
 from django.http import Http404
+from django.shortcuts import get_object_or_404
 from django.utils.translation import gettext as _
 
 from rest_framework import renderers, viewsets
@@ -16,6 +18,7 @@ from onadata.apps.api.permissions import AttachmentObjectPermissions
 from onadata.apps.logger.models.attachment import Attachment
 from onadata.apps.logger.models.xform import XForm
 from onadata.libs import filters
+from onadata.libs.data import parse_int
 from onadata.libs.mixins.authenticate_header_mixin import AuthenticateHeaderMixin
 from onadata.libs.mixins.cache_control_mixin import CacheControlMixin
 from onadata.libs.mixins.etags_mixin import ETagsMixin
@@ -34,8 +37,8 @@ def get_attachment_data(attachment, suffix):
     if suffix in list(settings.THUMB_CONF):
         image_url(attachment, suffix)
         suffix = settings.THUMB_CONF.get(suffix).get("suffix")
-        f = default_storage.open(get_path(attachment.media_file.name, suffix))
-        return f.read()
+        media_file = default_storage.open(get_path(attachment.media_file.name, suffix))
+        return media_file.read()
 
     return attachment.media_file.read()
 
@@ -77,13 +80,12 @@ class AttachmentViewSet(
             suffix = request.query_params.get("suffix")
             try:
                 data = get_attachment_data(self.object, suffix)
-            except IOError as e:
-                if str(e).startswith("File does not exist"):
-                    raise Http404() from e
+            except IOError as error:
+                if str(error).startswith("File does not exist"):
+                    raise Http404() from error
 
-                raise ParseError(e) from e
-            else:
-                return Response(data, content_type=self.object.mimetype)
+                raise ParseError(error) from error
+            return Response(data, content_type=self.object.mimetype)
 
         filename = request.query_params.get("filename")
         serializer = self.get_serializer(self.object)
@@ -107,13 +109,17 @@ class AttachmentViewSet(
         if request.user.is_anonymous:
             xform = request.query_params.get("xform")
             if xform:
-                xform = XForm.objects.get(id=xform)
-                if not xform.shared_data:
+                xform = parse_int(xform)
+                if xform:
+                    xform = get_object_or_404(XForm, pk=xform)
+                    if not xform.shared_data:
+                        raise Http404(_("Not Found"))
+                else:
                     raise Http404(_("Not Found"))
 
         # pylint: disable=attribute-defined-outside-init
         self.object_list = self.filter_queryset(self.get_queryset())
-        page = self.paginate_queryset(self.object_list)
+        page = self.paginate_queryset(self.object_list.order_by("pk"))
         if page is not None:
             serializer = self.get_serializer(page, many=True)
 

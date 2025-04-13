@@ -2,16 +2,19 @@
 """
 XForm submission XML parser utility functions.
 """
+
 import logging
 import re
-from xml.dom import minidom, Node
-
-import dateutil.parser
+from xml.dom import Node
 
 from django.utils.encoding import smart_str
 from django.utils.translation import gettext as _
 
-from onadata.libs.utils.common_tags import XFORM_ID_STRING, VERSION
+import dateutil.parser
+from defusedxml import minidom
+
+from onadata.libs.utils.common_tags import VERSION, XFORM_ID_STRING
+from onadata.libs.utils.common_tools import get_abbreviated_xpath
 
 
 class XLSFormError(Exception):
@@ -94,6 +97,9 @@ def get_meta_from_xml(xml_str, meta_name):
 
     uuid_tag = uuid_tags[0]
 
+    if meta_name == "entity":
+        return uuid_tag
+
     return uuid_tag.firstChild.nodeValue.strip() if uuid_tag.firstChild else None
 
 
@@ -167,9 +173,9 @@ def clean_and_parse_xml(xml_string):
 
     Returns an XML object via minidom.parseString(xml_string)
     """
-    clean_xml_str = xml_string.strip()
-    clean_xml_str = re.sub(r">\s+<", "><", smart_str(clean_xml_str))
-    xml_obj = minidom.parseString(smart_str(clean_xml_str))
+    clean_xml_str = re.sub(r">\s+<", "><", smart_str(xml_string.strip()))
+    xml_obj = minidom.parseString(clean_xml_str)
+
     return xml_obj
 
 
@@ -241,8 +247,7 @@ def _flatten_dict(data_dict, prefix):
         new_prefix = prefix + [key]
 
         if isinstance(value, dict):
-            for pair in _flatten_dict(value, new_prefix):
-                yield pair
+            yield from _flatten_dict(value, new_prefix)
         elif isinstance(value, list):
             for i, item in enumerate(value):
                 item_prefix = list(new_prefix)  # make a copy
@@ -257,8 +262,7 @@ def _flatten_dict(data_dict, prefix):
                     item_prefix[-1] += f"[{str(i + 1)}]"
 
                 if isinstance(item, dict):
-                    for pair in _flatten_dict(item, item_prefix):
-                        yield pair
+                    yield from _flatten_dict(item, item_prefix)
                 else:
                     yield (item_prefix, item)
         else:
@@ -276,8 +280,7 @@ def _flatten_dict_nest_repeats(data_dict, prefix):
     for key, value in data_dict.items():
         new_prefix = prefix + [key]
         if isinstance(value, dict):
-            for pair in _flatten_dict_nest_repeats(value, new_prefix):
-                yield pair
+            yield from _flatten_dict_nest_repeats(value, new_prefix)
         elif isinstance(value, list):
             repeats = []
 
@@ -324,11 +327,10 @@ def _get_all_attributes(node):
     """
     if hasattr(node, "hasAttributes") and node.hasAttributes():
         for key in node.attributes.keys():
-            yield key, node.getAttribute(key)
+            yield key, node.getAttribute(key), node.tagName
 
     for child in node.childNodes:
-        for pair in _get_all_attributes(child):
-            yield pair
+        yield from _get_all_attributes(child)
 
 
 class XFormInstanceParser:
@@ -348,7 +350,7 @@ class XFormInstanceParser:
         self._xml_obj = clean_and_parse_xml(xml_str)
         self._root_node = self._xml_obj.documentElement
         repeats = [
-            e.get_abbreviated_xpath()
+            get_abbreviated_xpath(e.get_xpath())
             for e in self.data_dicionary.get_survey_elements_of_type("repeat")
         ]
 
@@ -386,9 +388,13 @@ class XFormInstanceParser:
         # pylint: disable=attribute-defined-outside-init
         self._attributes = {}
         all_attributes = list(_get_all_attributes(self._root_node))
-        for key, value in all_attributes:
+        for key, value, node_name in all_attributes:
             # Since enketo forms may have the template attribute in
             # multiple xml tags, overriding and log when this occurs
+            if node_name == "entity":
+                # We ignore attributes for the entity node
+                continue
+
             if key in self._attributes:
                 logger = logging.getLogger("console_logger")
                 logger.debug(
@@ -447,3 +453,9 @@ def parse_xform_instance(xml_str, data_dictionary):
     """
     parser = XFormInstanceParser(xml_str, data_dictionary)
     return parser.get_flat_dict_with_attributes()
+
+
+def get_entity_uuid_from_xml(xml):
+    """Returns the uuid for the XML submission's entity"""
+    entity_node = get_meta_from_xml(xml, "entity")
+    return entity_node.getAttribute("id")

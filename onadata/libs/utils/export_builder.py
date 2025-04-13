@@ -3,6 +3,7 @@
 """
 ExportBuilder
 """
+
 from __future__ import unicode_literals
 
 import csv
@@ -16,32 +17,53 @@ from django.core.files.temp import NamedTemporaryFile
 
 from openpyxl.utils.datetime import to_excel
 from openpyxl.workbook import Workbook
-from pyxform.question import Question
+from pyxform.question import Option, Question
 from pyxform.section import RepeatingSection, Section
-from savReaderWriter import SavWriter
+from savReaderWriter import SavWriter  # pylint: disable=no-name-in-module
 from six import iteritems
 
 from onadata.apps.logger.models.osmdata import OsmData
-from onadata.apps.logger.models.xform import (QUESTION_TYPES_TO_EXCLUDE,
-                                              _encode_for_mongo)
+from onadata.apps.logger.models.xform import (
+    QUESTION_TYPES_TO_EXCLUDE,
+    _encode_for_mongo,
+)
 from onadata.apps.viewer.models.data_dictionary import DataDictionary
-from onadata.libs.utils.common_tags import (ATTACHMENTS, BAMBOO_DATASET_ID,
-                                            DELETEDAT, DURATION, GEOLOCATION,
-                                            ID, INDEX, MULTIPLE_SELECT_TYPE,
-                                            NOTES, PARENT_INDEX,
-                                            PARENT_TABLE_NAME,
-                                            REPEAT_INDEX_TAGS, REVIEW_COMMENT,
-                                            REVIEW_DATE, REVIEW_STATUS,
-                                            SAV_255_BYTES_TYPE,
-                                            SAV_NUMERIC_TYPE, SELECT_BIND_TYPE,
-                                            SELECT_ONE, STATUS,
-                                            SUBMISSION_TIME, SUBMITTED_BY,
-                                            TAGS, UUID, VERSION,
-                                            XFORM_ID_STRING)
-from onadata.libs.utils.common_tools import (get_choice_label,
-                                             get_choice_label_value,
-                                             get_value_or_attachment_uri,
-                                             str_to_bool, track_task_progress)
+from onadata.libs.utils.common_tags import (
+    ATTACHMENTS,
+    BAMBOO_DATASET_ID,
+    DELETEDAT,
+    DURATION,
+    GEOLOCATION,
+    ID,
+    INDEX,
+    MULTIPLE_SELECT_TYPE,
+    NOTES,
+    PARENT_INDEX,
+    PARENT_TABLE_NAME,
+    REPEAT_INDEX_TAGS,
+    REVIEW_COMMENT,
+    REVIEW_DATE,
+    REVIEW_STATUS,
+    SAV_255_BYTES_TYPE,
+    SAV_NUMERIC_TYPE,
+    SELECT_BIND_TYPE,
+    SELECT_ONE,
+    STATUS,
+    SUBMISSION_TIME,
+    SUBMITTED_BY,
+    TAGS,
+    UUID,
+    VERSION,
+    XFORM_ID_STRING,
+)
+from onadata.libs.utils.common_tools import (
+    get_abbreviated_xpath,
+    get_choice_label,
+    get_choice_label_value,
+    get_value_or_attachment_uri,
+    str_to_bool,
+    track_task_progress,
+)
 from onadata.libs.utils.mongo import _decode_from_mongo, _is_invalid_for_mongo
 
 # the bind type of select multiples that we use to compare
@@ -85,8 +107,11 @@ def encode_if_str(row, key, encode_dates=False, sav_writer=None):
     return val
 
 
-# pylint: disable=too-many-arguments,too-many-locals,too-many-branches
-def dict_to_joined_export(data, index, indices, name, survey, row, media_xpaths=None):
+# pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
+# pylint: disable=too-many-nested-blocks,too-many-branches
+def dict_to_joined_export(
+    data, index, indices, name, survey, row, host, media_xpaths=None
+):
     """
     Converts a dict into one or more tabular datasets
     :param data: current record which can be changed or updated
@@ -98,9 +123,8 @@ def dict_to_joined_export(data, index, indices, name, survey, row, media_xpaths=
     """
     output = {}
     media_xpaths = [] if media_xpaths is None else media_xpaths
-    # pylint: disable=too-many-nested-blocks
     if isinstance(data, dict):
-        for (key, val) in iteritems(data):
+        for key, val in iteritems(data):
             if isinstance(val, list) and key not in [NOTES, ATTACHMENTS, TAGS]:
                 output[key] = []
                 for child in val:
@@ -109,7 +133,14 @@ def dict_to_joined_export(data, index, indices, name, survey, row, media_xpaths=
                     indices[key] += 1
                     child_index = indices[key]
                     new_output = dict_to_joined_export(
-                        child, child_index, indices, key, survey, row, media_xpaths
+                        child,
+                        child_index,
+                        indices,
+                        key,
+                        survey,
+                        row,
+                        host,
+                        media_xpaths,
                     )
                     item = {
                         INDEX: child_index,
@@ -118,7 +149,7 @@ def dict_to_joined_export(data, index, indices, name, survey, row, media_xpaths=
                     }
                     # iterate over keys within new_output and append to
                     # main output
-                    for (out_key, out_val) in iteritems(new_output):
+                    for out_key, out_val in iteritems(new_output):
                         if isinstance(out_val, list):
                             if out_key not in output:
                                 output[out_key] = []
@@ -143,6 +174,7 @@ def dict_to_joined_export(data, index, indices, name, survey, row, media_xpaths=
                         data_dictionary,
                         media_xpaths,
                         row and row.get(ATTACHMENTS),
+                        host=host,
                     )
 
     return output
@@ -191,8 +223,7 @@ def string_to_date_with_xls_validation(date_str):
         to_excel(date_obj)
     except ValueError:
         return date_str
-    else:
-        return date_obj
+    return date_obj
 
 
 # pylint: disable=invalid-name
@@ -202,7 +233,7 @@ def decode_mongo_encoded_section_names(data):
     :param data: A dictionary to decode.
     """
     results = {}
-    for (k, v) in iteritems(data):
+    for k, v in iteritems(data):
         new_v = v
         if isinstance(v, dict):
             new_v = decode_mongo_encoded_section_names(v)
@@ -340,21 +371,34 @@ class ExportBuilder:
                 # incase abbreviated_xpath is a choices xpath
                 if elem is None:
                     pass
-                elif elem.type == "":
-                    title = "/".join([elem.parent.name, elem.name])
+                elif isinstance(elem, Option):
+                    parent = data_dictionary.get_survey_element(
+                        field_delimiter.join(
+                            abbreviated_xpath.split(field_delimiter)[:-1]
+                        )
+                    )
+                    title = field_delimiter.join([parent.name, elem.name])
                 else:
                     title = elem.name
 
-        if field_delimiter != "/":
+        if field_delimiter != "/" and "/" in title:
             title = field_delimiter.join(title.split("/"))
-
         return title
 
     def get_choice_label_from_dict(self, label):
-        """Returns the choice label for the default language."""
+        """Returns the choice label for the default language
+
+        If a label for the target language is blank then the default
+        language is used
+        """
         if isinstance(label, dict):
-            language = self.get_default_language(list(label))
-            label = label.get(self.language or language)
+            default_language = self.get_default_language(list(label))
+            default_label = label.get(default_language)
+
+            if self.language:
+                return label.get(self.language, default_label)
+
+            return default_label
 
         return label
 
@@ -380,13 +424,17 @@ class ExportBuilder:
             child.parameters and child.parameters.get("randomize")
         )
         if (
-            (not child.children and child.choice_filter) or is_choice_randomized
+            (
+                (hasattr(child, "children") and not child.children)
+                and child.choice_filter
+            )
+            or is_choice_randomized
         ) and child.itemset:
             itemset = data_dicionary.survey.to_json_dict()["choices"].get(child.itemset)
             choices = (
                 [
                     get_choice_dict(
-                        "/".join([child.get_abbreviated_xpath(), i["name"]]),
+                        "/".join([get_abbreviated_xpath(child.get_xpath()), i["name"]]),
                         self.get_choice_label_from_dict(i["label"]),
                     )
                     for i in itemset
@@ -397,10 +445,10 @@ class ExportBuilder:
         else:
             choices = [
                 get_choice_dict(
-                    c.get_abbreviated_xpath(),
+                    get_abbreviated_xpath("/".join([child.get_xpath(), c.name])),
                     get_choice_label(c.label, data_dicionary, language=self.language),
                 )
-                for c in child.children
+                for c in child.choices.options
             ]
 
         return choices
@@ -418,7 +466,7 @@ class ExportBuilder:
             self.__init__()  # pylint: disable=unnecessary-dunder-call
         data_dicionary = get_data_dictionary_from_survey(survey)
 
-        # pylint: disable=too-many-locals,too-many-branches,too-many-arguments
+        # pylint: disable=too-many-arguments,too-many-positional-arguments
         def build_sections(
             current_section,
             survey_element,
@@ -432,7 +480,8 @@ class ExportBuilder:
             remove_group_name=False,
             language=None,
         ):
-            # pylint: disable=too-many-nested-blocks
+            # pylint: disable=too-many-nested-blocks,too-many-branches
+            # pylint: disable=too-many-locals
             for child in survey_element.children:
                 current_section_name = current_section["name"]
                 # if a section, recurs
@@ -441,7 +490,7 @@ class ExportBuilder:
                     if isinstance(child, RepeatingSection):
                         # section_name in recursive call changes
                         section = {
-                            "name": child.get_abbreviated_xpath(),
+                            "name": get_abbreviated_xpath(child.get_xpath()),
                             "elements": [],
                         }
                         self.sections.append(section)
@@ -475,13 +524,13 @@ class ExportBuilder:
                         )
                 elif isinstance(child, Question) and (
                     child.bind.get("type") not in QUESTION_TYPES_TO_EXCLUDE
-                    and child.type not in QUESTION_TYPES_TO_EXCLUDE
+                    and child.type not in QUESTION_TYPES_TO_EXCLUDE  # noqa W503
                 ):
                     # add to survey_sections
                     if isinstance(child, Question):
-                        child_xpath = child.get_abbreviated_xpath()
+                        child_xpath = get_abbreviated_xpath(child.get_xpath())
                         _title = ExportBuilder.format_field_title(
-                            child.get_abbreviated_xpath(),
+                            get_abbreviated_xpath(child.get_xpath()),
                             field_delimiter,
                             data_dicionary,
                             remove_group_name,
@@ -490,7 +539,7 @@ class ExportBuilder:
                             data_dicionary.get_label(
                                 child_xpath, elem=child, language=language
                             )
-                            or _title
+                            or _title  # noqa W503
                         )
                         current_section["elements"].append(
                             {
@@ -511,7 +560,7 @@ class ExportBuilder:
                     # if its a select multiple, make columns out of its choices
                     if (
                         child.bind.get("type") == SELECT_BIND_TYPE
-                        and child.type == MULTIPLE_SELECT_TYPE
+                        and child.type == MULTIPLE_SELECT_TYPE  # noqa W503
                     ):
                         choices = []
                         if self.SPLIT_SELECT_MULTIPLES:
@@ -529,16 +578,16 @@ class ExportBuilder:
                         _append_xpaths_to_section(
                             current_section_name,
                             select_multiples,
-                            child.get_abbreviated_xpath(),
+                            get_abbreviated_xpath(child.get_xpath()),
                             choices,
                         )
 
                     # split gps fields within this section
                     if child.bind.get("type") == GEOPOINT_BIND_TYPE:
                         # add columns for geopoint components
-                        parent_xpath = child.get_abbreviated_xpath()
+                        parent_xpath = get_abbreviated_xpath(child.get_xpath())
                         xpaths = DataDictionary.get_additional_geopoint_xpaths(
-                            child.get_abbreviated_xpath()
+                            get_abbreviated_xpath(child.get_xpath())
                         )
                         for xpath in xpaths:
                             _title = ExportBuilder.format_field_title(
@@ -560,7 +609,7 @@ class ExportBuilder:
                         _append_xpaths_to_section(
                             current_section_name,
                             gps_fields,
-                            child.get_abbreviated_xpath(),
+                            get_abbreviated_xpath(child.get_xpath()),
                             xpaths,
                         )
 
@@ -585,17 +634,17 @@ class ExportBuilder:
                         _append_xpaths_to_section(
                             current_section_name,
                             osm_fields,
-                            child.get_abbreviated_xpath(),
+                            get_abbreviated_xpath(child.get_xpath()),
                             xpaths,
                         )
                     if (
                         child.bind.get("type") == SELECT_BIND_TYPE
-                        and child.type == SELECT_ONE
+                        and child.type == SELECT_ONE  # noqa W503
                     ):
                         _append_xpaths_to_section(
                             current_section_name,
                             select_ones,
-                            child.get_abbreviated_xpath(),
+                            get_abbreviated_xpath(child.get_xpath()),
                             [],
                         )
 
@@ -612,7 +661,9 @@ class ExportBuilder:
             osm_columns = []
             if osm_field and xform:
                 osm_columns = OsmData.get_tag_keys(
-                    xform, osm_field.get_abbreviated_xpath(), include_prefix=True
+                    xform,
+                    get_abbreviated_xpath(osm_field.get_xpath()),
+                    include_prefix=True,
                 )
             return osm_columns
 
@@ -647,7 +698,7 @@ class ExportBuilder:
 
         return matches[0]
 
-    # pylint: disable=too-many-arguments
+    # pylint: disable=too-many-arguments, too-many-positional-arguments
     @classmethod
     def split_select_multiples(
         cls,
@@ -679,7 +730,7 @@ class ExportBuilder:
         :return: the row dict with select multiples choice as fields in the row
         """
         # for each select_multiple, get the associated data and split it
-        for (xpath, choices) in iteritems(select_multiples):
+        for xpath, choices in iteritems(select_multiples):
             # get the data matching this xpath
             data = row.get(xpath) and str(row.get(xpath))
             selections = []
@@ -693,42 +744,40 @@ class ExportBuilder:
                 if show_choice_labels:
                     row.update(
                         {
-                            choice["label"]: choice["_label"]
-                            if selections and choice["xpath"] in selections
-                            else None
+                            choice["label"]: (
+                                choice["_label"]
+                                if selections and choice["xpath"] in selections
+                                else None
+                            )
                             for choice in choices
                         }
                     )
                 else:
                     row.update(
                         {
-                            choice["xpath"]: data.split()[
-                                selections.index(choice["xpath"])
-                            ]
-                            if selections and choice["xpath"] in selections
-                            else None
+                            choice["xpath"]: (
+                                data.split()[selections.index(choice["xpath"])]
+                                if selections and choice["xpath"] in selections
+                                else None
+                            )
                             for choice in choices
                         }
                     )
             elif binary_select_multiples:
                 row.update(
                     {
-                        choice["label"]
-                        if show_choice_labels
-                        else choice["xpath"]: YES
-                        if choice["xpath"] in selections
-                        else NO
+                        choice["label"] if show_choice_labels else choice["xpath"]: (
+                            YES if choice["xpath"] in selections else NO
+                        )
                         for choice in choices
                     }
                 )
             else:
                 row.update(
                     {
-                        choice["label"]
-                        if show_choice_labels
-                        else choice["xpath"]: choice["xpath"] in selections
-                        if selections
-                        else None
+                        choice["label"] if show_choice_labels else choice["xpath"]: (
+                            choice["xpath"] in selections if selections else None
+                        )
                         for choice in choices
                     }
                 )
@@ -738,7 +787,7 @@ class ExportBuilder:
     def split_gps_components(cls, row, gps_fields):
         """Splits GPS components into their own fields."""
         # for each gps_field, get associated data and split it
-        for (xpath, gps_components) in iteritems(gps_fields):
+        for xpath, gps_components in iteritems(gps_fields):
             data = row.get(xpath)
             if data:
                 gps_parts = data.split()
@@ -749,7 +798,7 @@ class ExportBuilder:
     @classmethod
     def decode_mongo_encoded_fields(cls, row, encoded_fields):
         """Update encoded fields with their corresponding xpath"""
-        for (xpath, encoded_xpath) in iteritems(encoded_fields):
+        for xpath, encoded_xpath in iteritems(encoded_fields):
             if row.get(encoded_xpath):
                 val = row.pop(encoded_xpath)
                 row.update({xpath: val})
@@ -819,8 +868,8 @@ class ExportBuilder:
             value = row.get(elm["xpath"])
             if (
                 elm["type"] in ExportBuilder.TYPES_TO_CONVERT
-                and value is not None
-                and value != ""
+                and value is not None  # noqa W503
+                and value != ""  # noqa W503
             ):
                 row[elm["xpath"]] = ExportBuilder.convert_type(value, elm["type"])
 
@@ -893,6 +942,8 @@ class ExportBuilder:
         index = 1
         indices = {}
         survey_name = self.survey.name
+        options = kwargs.get("options")
+        host = options.get("host") if options else None
         for i, row_data in enumerate(data, start=1):
             # decode mongo section names
             joined_export = dict_to_joined_export(
@@ -902,6 +953,7 @@ class ExportBuilder:
                 survey_name,
                 self.survey,
                 row_data,
+                host,
                 media_xpaths,
             )
             output = decode_mongo_encoded_section_names(joined_export)
@@ -932,7 +984,7 @@ class ExportBuilder:
 
         # write zipfile
         with ZipFile(path, "w", ZIP_DEFLATED, allowZip64=True) as zip_file:
-            for (section_name, csv_def) in iteritems(csv_defs):
+            for section_name, csv_def in iteritems(csv_defs):
                 csv_file = csv_def["csv_file"]
                 csv_file.seek(0)
                 zip_file.write(
@@ -940,7 +992,7 @@ class ExportBuilder:
                 )
 
         # close files when we are done
-        for (section_name, csv_def) in iteritems(csv_defs):
+        for section_name, csv_def in iteritems(csv_defs):
             csv_def["csv_file"].close()
 
     @classmethod
@@ -1031,6 +1083,9 @@ class ExportBuilder:
         index = 1
         indices = {}
         survey_name = self.survey.name
+
+        options = kwargs.get("options")
+        host = options.get("host") if options else None
         for i, row_data in enumerate(data, start=1):
             joined_export = dict_to_joined_export(
                 row_data,
@@ -1039,6 +1094,7 @@ class ExportBuilder:
                 survey_name,
                 self.survey,
                 row_data,
+                host,
                 media_xpaths,
             )
             output = decode_mongo_encoded_section_names(joined_export)
@@ -1091,12 +1147,14 @@ class ExportBuilder:
         end = kwargs.get("end")
         dataview = kwargs.get("dataview")
         xform = kwargs.get("xform")
-        options = kwargs.get("options")
+        options = kwargs.get("options", {})
         total_records = kwargs.get("total_records")
+        host = options.get("host") if options else None
         win_excel_utf8 = options.get("win_excel_utf8") if options else False
         index_tags = options.get(REPEAT_INDEX_TAGS, self.REPEAT_INDEX_TAGS)
         show_choice_labels = options.get("show_choice_labels", False)
         language = options.get("language")
+        entity_list = kwargs.get("entity_list")
 
         csv_builder = CSVDataFrameBuilder(
             username,
@@ -1120,9 +1178,11 @@ class ExportBuilder:
             show_choice_labels=show_choice_labels,
             include_reviews=self.INCLUDE_REVIEWS,
             language=language,
+            host=host,
+            entity_list=entity_list,
         )
 
-        csv_builder.export_to(path, dataview=dataview)
+        csv_builder.export_to(path, data, dataview=dataview)
 
     def get_default_language(self, languages):
         """Return the default languange of the XForm."""
@@ -1150,11 +1210,12 @@ class ExportBuilder:
         for question in choice_questions:
             if (
                 xpath_var_names
-                and question.get_abbreviated_xpath() not in xpath_var_names
+                and get_abbreviated_xpath(question.get_xpath())
+                not in xpath_var_names  # noqa W503
             ):
                 continue
             var_name = (
-                xpath_var_names.get(question.get_abbreviated_xpath())
+                xpath_var_names.get(get_abbreviated_xpath(question.get_xpath()))
                 if xpath_var_names
                 else question["name"]
             )
@@ -1207,20 +1268,27 @@ class ExportBuilder:
                 # check if it is a choice part of multiple choice
                 # type is likely empty string, split multi select is binary
                 element = data_dictionary.get_element(xpath)
-                if element and element.type == SELECT_ONE:
+                if (
+                    element
+                    and not isinstance(element, Option)
+                    and element.type == SELECT_ONE
+                ):
                     # Determine if all select1 choices are numeric in nature.
                     # If the choices are numeric in nature have the field type
                     # in spss be numeric
                     choices = list(all_value_labels[var_name])
-                    if len(choices) == 0:
-                        return False
-                    return is_all_numeric(choices)
-                if element and element.type == "" and value_select_multiples:
+                    if len(choices) != 0:
+                        return is_all_numeric(choices)
+
+                if element and isinstance(element, Option) and value_select_multiples:
                     return is_all_numeric([element.name])
 
-                parent_xpath = "/".join(xpath.split("/")[:-1])
-                parent = data_dictionary.get_element(parent_xpath)
-                return parent and parent.type == MULTIPLE_SELECT_TYPE
+                if element:
+                    parent_xpath = "/".join(xpath.split("/")[:-1])
+                    if parent_xpath:
+                        parent = data_dictionary.get_element(parent_xpath)
+                        return parent and parent.type == MULTIPLE_SELECT_TYPE
+
             return False
 
         value_select_multiples = self.VALUE_SELECT_MULTIPLES
@@ -1285,29 +1353,37 @@ class ExportBuilder:
             [
                 (
                     _var_types[element["xpath"]],
-                    SAV_NUMERIC_TYPE
-                    if _is_numeric(
-                        element["xpath"], element["type"], self.data_dicionary
-                    )
-                    else SAV_255_BYTES_TYPE,
+                    (
+                        SAV_NUMERIC_TYPE
+                        if _is_numeric(
+                            element["xpath"], element["type"], self.data_dicionary
+                        )
+                        else SAV_255_BYTES_TYPE
+                    ),
                 )
                 for element in elements
             ]
-            + [
+            + [  # noqa W503
                 (
                     _var_types[item],
-                    SAV_NUMERIC_TYPE
-                    if item in ["_id", "_index", "_parent_index", SUBMISSION_TIME]
-                    else SAV_255_BYTES_TYPE,
+                    (
+                        SAV_NUMERIC_TYPE
+                        if item in ["_id", "_index", "_parent_index", SUBMISSION_TIME]
+                        else SAV_255_BYTES_TYPE
+                    ),
                 )
                 for item in self.extra_columns
             ]
-            + [
+            + [  # noqa W503
                 (
                     x[1],
-                    SAV_NUMERIC_TYPE
-                    if _is_numeric(x[0], _get_element_type(x[0]), self.data_dicionary)
-                    else SAV_255_BYTES_TYPE,
+                    (
+                        SAV_NUMERIC_TYPE
+                        if _is_numeric(
+                            x[0], _get_element_type(x[0]), self.data_dicionary
+                        )
+                        else SAV_255_BYTES_TYPE
+                    ),
                 )
                 for x in duplicate_names
             ]
@@ -1365,6 +1441,9 @@ class ExportBuilder:
         index = 1
         indices = {}
         survey_name = self.survey.name
+
+        options = kwargs.get("options")
+        host = options.get("host") if options else None
         for i, row_data in enumerate(data, start=1):
             # decode mongo section names
             joined_export = dict_to_joined_export(
@@ -1374,6 +1453,7 @@ class ExportBuilder:
                 survey_name,
                 self.survey,
                 row_data,
+                host,
                 media_xpaths,
             )
             output = decode_mongo_encoded_section_names(joined_export)
@@ -1400,12 +1480,12 @@ class ExportBuilder:
             index += 1
             track_task_progress(i, total_records)
 
-        for (section_name, sav_def) in iteritems(sav_defs):
+        for section_name, sav_def in iteritems(sav_defs):
             sav_def["sav_writer"].closeSavFile(sav_def["sav_writer"].fh, mode="wb")
 
         # write zipfile
         with ZipFile(path, "w", ZIP_DEFLATED, allowZip64=True) as zip_file:
-            for (section_name, sav_def) in iteritems(sav_defs):
+            for section_name, sav_def in iteritems(sav_defs):
                 sav_file = sav_def["sav_file"]
                 sav_file.seek(0)
                 zip_file.write(
@@ -1413,7 +1493,7 @@ class ExportBuilder:
                 )
 
         # close files when we are done
-        for (section_name, sav_def) in iteritems(sav_defs):
+        for section_name, sav_def in iteritems(sav_defs):
             sav_def["sav_file"].close()
 
     def get_fields(self, dataview, section, key):
@@ -1421,17 +1501,28 @@ class ExportBuilder:
         Return list of element value with the key in section['elements'].
         """
         if dataview:
-            return [
+            columns = [
+                (
+                    element.get("_label_xpath") or element[key]
+                    if self.SHOW_CHOICE_LABELS
+                    else element[key]
+                )
+                for element in section["elements"]
+                if element["title"] in dataview.columns
+            ]
+
+            # add extra columns
+            for column in filter(lambda col: col not in columns, dataview.columns):
+                if column in self.extra_columns:
+                    columns.append(column)
+
+            return columns
+
+        return [
+            (
                 element.get("_label_xpath") or element[key]
                 if self.SHOW_CHOICE_LABELS
                 else element[key]
-                for element in section["elements"]
-                if element["title"] in dataview.columns
-            ] + self.extra_columns
-
-        return [
-            element.get("_label_xpath") or element[key]
-            if self.SHOW_CHOICE_LABELS
-            else element[key]
+            )
             for element in section["elements"]
         ] + self.extra_columns

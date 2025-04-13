@@ -15,7 +15,7 @@ DATABASES = {
         "NAME": "onadata",
         "USER": "onadata",
         "PASSWORD": "onadata",
-        "HOST": "localhost",
+        "HOST": os.environ.get("DB_HOST", "localhost"),
     }
 }
 
@@ -69,3 +69,6 @@ VERIFIED_KEY_TEXT = "ALREADY_ACTIVATED"
 ODK_TOKEN_FERNET_KEY = "ROsB4T8s1rCJskAdgpTQEKfH2x2K_EX_YBi3UFyoYng="  # nosec
 OPENID_CONNECT_PROVIDERS = {}
 AUTH_PASSWORD_VALIDATORS = []
+
+# disable user creation
+DISABLE_CREATING_USERS = False

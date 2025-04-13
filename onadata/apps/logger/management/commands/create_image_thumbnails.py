@@ -2,9 +2,10 @@
 """
 create_image_thumbnails - creates thumbnails for all form images and stores them.
 """
+
 from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.core.files.storage import get_storage_class
+from django.core.files.storage import storages
 from django.core.management.base import BaseCommand, CommandError
 from django.utils.translation import gettext as _
 from django.utils.translation import gettext_lazy
@@ -48,24 +49,26 @@ class Command(BaseCommand):
             username = options.get("username")
             try:
                 user = User.objects.get(username=username)
-            except User.DoesNotExist as e:
-                raise CommandError(f"Error: username {username} does not exist") from e
+            except User.DoesNotExist as error:
+                raise CommandError(
+                    f"Error: username {username} does not exist"
+                ) from error
             attachments_qs = attachments_qs.filter(instance__user=user)
         if options.get("id_string"):
             id_string = options.get("id_string")
             try:
                 xform = XForm.objects.get(id_string=id_string)
-            except XForm.DoesNotExist as e:
+            except XForm.DoesNotExist as error:
                 raise CommandError(
                     f"Error: Form with id_string {id_string} does not exist"
-                ) from e
+                ) from error
             attachments_qs = attachments_qs.filter(instance__xform=xform)
-        file_storage = get_storage_class(
-            "django.core.files.storage.FileSystemStorage"
-        )()
+        file_storage = storages.create_storage(
+            {"BACKEND": "django.core.files.storage.FileSystemStorage"}
+        )
         for att in queryset_iterator(attachments_qs):
             filename = att.media_file.name
-            default_storage = get_storage_class()()
+            default_storage = storages["default"]
             full_path = get_path(filename, settings.THUMB_CONF["small"]["suffix"])
             if options.get("force") is not None:
                 for suffix in ["small", "medium", "large"]:

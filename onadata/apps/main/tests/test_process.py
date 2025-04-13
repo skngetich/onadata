@@ -2,15 +2,17 @@
 """
 Test usage process - form publishing and export.
 """
+
 import csv
 import fnmatch
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from hashlib import md5
 from io import BytesIO
-from xml.dom import Node, minidom
+from unittest.mock import patch
+from xml.dom import Node
 
 from django.conf import settings
 from django.core.files.uploadedfile import UploadedFile
@@ -18,11 +20,10 @@ from django.test.testcases import SerializeMixin
 from django.urls import reverse
 
 import openpyxl
-import pytz
 import requests
+from defusedxml import minidom
 from django_digest.test import Client as DigestClient
 from flaky import flaky
-from mock import patch
 from six import iteritems
 
 from onadata.apps.logger.models import XForm
@@ -75,10 +76,10 @@ class TestProcess(TestBase, SerializeMixin):
         """
         Update stuff like submission time so we can compare within out fixtures
         """
-        for (uuid, submission_time) in iteritems(self.uuid_to_submission_times):
+        for uuid, submission_time in iteritems(self.uuid_to_submission_times):
             i = self.xform.instances.get(uuid=uuid)
-            i.date_created = pytz.timezone("UTC").localize(
-                datetime.strptime(submission_time, MONGO_STRFTIME)
+            i.date_created = datetime.strptime(submission_time, MONGO_STRFTIME).replace(
+                tzinfo=timezone.utc
             )
             i.json = i.get_full_dict()
             i.save()
@@ -156,8 +157,10 @@ class TestProcess(TestBase, SerializeMixin):
                     f"/{self.user.username}/", {"xls_url": xls_url}
                 )
 
-                mock_requests.get.assert_called_with(xls_url)
-                mock_requests.head.assert_called_with(xls_url, allow_redirects=True)
+                mock_requests.get.assert_called_with(xls_url, timeout=30)
+                mock_requests.head.assert_called_with(
+                    xls_url, allow_redirects=True, timeout=30
+                )
                 # make sure publishing the survey worked
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(XForm.objects.count(), pre_count + 1)
@@ -201,7 +204,7 @@ class TestProcess(TestBase, SerializeMixin):
                 response = self.client.post(
                     f"/{self.user.username}/", {"xls_url": xls_url}
                 )
-                mock_requests.get.assert_called_with(xls_url)
+                mock_requests.get.assert_called_with(xls_url, timeout=30)
 
                 # make sure publishing the survey worked
                 self.assertEqual(response.status_code, 200)
@@ -368,7 +371,6 @@ class TestProcess(TestBase, SerializeMixin):
         self.assertEqual(sorted(next(actual_csv)), sorted(expected_list))
 
     def _check_data_for_csv_export(self):
-
         data = [
             {
                 "available_transportation_types_to_referral_facility/ambulance": True,
@@ -391,7 +393,7 @@ class TestProcess(TestBase, SerializeMixin):
         ]
         for d_from_db in self.data_dictionary.get_data_for_excel():
             test_dict = {}
-            for (k, v) in iteritems(d_from_db):
+            for k, v in iteritems(d_from_db):
                 if (
                     k
                     not in [
@@ -476,7 +478,7 @@ class TestProcess(TestBase, SerializeMixin):
                 "image1": "1335783522563.jpg",
                 "meta/instanceID": "uuid:5b2cc313-fc09-437e-8149-fcd32f695d41",
                 "_uuid": "5b2cc313-fc09-437e-8149-fcd32f695d41",
-                "_submission_time": "2013-02-14T15:37:21",
+                "_submission_time": "2013-02-14T15:37:21+00:00",
                 "_tags": "",
                 "_notes": "",
                 "_version": "2014111",
@@ -492,7 +494,7 @@ class TestProcess(TestBase, SerializeMixin):
                 self.bicycle_key: "weekly",
                 "meta/instanceID": "uuid:f3d8dc65-91a6-4d0f-9e97-802128083390",
                 "_uuid": "f3d8dc65-91a6-4d0f-9e97-802128083390",
-                "_submission_time": "2013-02-14T15:37:22",
+                "_submission_time": "2013-02-14T15:37:22+00:00",
                 "_tags": "",
                 "_notes": "",
                 "_version": "2014111",
@@ -507,7 +509,7 @@ class TestProcess(TestBase, SerializeMixin):
                 self.ambulance_key: "weekly",
                 "meta/instanceID": "uuid:9c6f3468-cfda-46e8-84c1-75458e72805d",
                 "_uuid": "9c6f3468-cfda-46e8-84c1-75458e72805d",
-                "_submission_time": "2013-02-14T15:37:23",
+                "_submission_time": "2013-02-14T15:37:23+00:00",
                 "_tags": "",
                 "_notes": "",
                 "_version": "2014111",
@@ -521,10 +523,11 @@ class TestProcess(TestBase, SerializeMixin):
                 "available_transportation_types_to_referral_facility/taxi": "True",
                 "available_transportation_types_to_referral_facility/other": "True",
                 "available_transportation_types_to_referral_facility_other": "camel",
+                self.other_key: "other",
                 self.taxi_key: "daily",
                 "meta/instanceID": "uuid:9f0a1508-c3b7-4c99-be00-9b237c26bcbf",
                 "_uuid": "9f0a1508-c3b7-4c99-be00-9b237c26bcbf",
-                "_submission_time": "2013-02-14T15:37:24",
+                "_submission_time": "2013-02-14T15:37:24+00:00",
                 "_tags": "",
                 "_notes": "",
                 "_version": "2014111",
@@ -543,7 +546,7 @@ class TestProcess(TestBase, SerializeMixin):
         for row, expected_dict in zip(actual_csv, data):
             test_dict = {}
             row_dict = dict(zip(headers, row))
-            for (k, v) in iteritems(row_dict):
+            for k, v in iteritems(row_dict):
                 if not (v in ["n/a", "False"] or k in additional_headers):
                     test_dict[k] = v
             this_list = []
@@ -578,8 +581,8 @@ class TestProcess(TestBase, SerializeMixin):
         )
         content = get_response_content(response, decode=False)
         actual_xls = openpyxl.load_workbook(filename=BytesIO(content))
-        actual_sheet = actual_xls.get_sheet_by_name("data")
-        expected_sheet = expected_xls.get_sheet_by_name("transportation")
+        actual_sheet = actual_xls["data"]
+        expected_sheet = expected_xls["transportation"]
         # check headers
         self.assertEqual(list(actual_sheet.values)[0], list(expected_sheet.values)[0])
 
@@ -592,10 +595,9 @@ class TestProcess(TestBase, SerializeMixin):
             i = 1
             actual_row = list(list(actual_sheet.values)[i])
             expected_row = list(list(expected_sheet.values)[i])
-
             # remove _id from result set, varies depending on the database
-            del actual_row[23]
-            del expected_row[23]
+            del actual_row[24]
+            del expected_row[24]
             self.assertEqual(actual_row, expected_row)
 
     def _check_delete(self):

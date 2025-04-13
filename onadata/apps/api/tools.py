@@ -2,6 +2,8 @@
 """
 API utility functions.
 """
+
+import importlib
 import os
 import tempfile
 from datetime import datetime
@@ -10,7 +12,7 @@ from django import forms
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.sites.models import Site
-from django.core.files.storage import get_storage_class
+from django.core.files.storage import storages
 from django.core.files.uploadedfile import InMemoryUploadedFile
 from django.core.validators import URLValidator, ValidationError
 from django.db import transaction
@@ -30,59 +32,42 @@ from six import iteritems
 from taggit.forms import TagField
 
 from onadata.apps.api.models.organization_profile import (
-    OrganizationProfile,
-    add_user_to_team,
-    get_or_create_organization_owners_team,
-    get_organization_members_team,
-)
+    OrganizationProfile, add_user_to_team,
+    get_or_create_organization_owners_team, get_organization_members_team)
 from onadata.apps.api.models.team import Team
-from onadata.apps.logger.models import DataView, Instance, Project, XForm
+from onadata.apps.logger.models import (DataView, EntityList, Instance,
+                                        Project, XForm)
 from onadata.apps.main.forms import QuickConverter
 from onadata.apps.main.models.meta_data import MetaData
 from onadata.apps.main.models.user_profile import UserProfile
 from onadata.apps.viewer.models.parsed_instance import datetime_from_str
 from onadata.libs.baseviewset import DefaultBaseViewset
-from onadata.libs.models.share_project import ShareProject
-from onadata.libs.permissions import (
-    ROLES,
-    DataEntryMinorRole,
-    DataEntryOnlyRole,
-    DataEntryRole,
-    EditorMinorRole,
-    EditorRole,
-    ManagerRole,
-    OwnerRole,
-    get_role,
-    get_role_in_org,
-    is_organization,
-)
+from onadata.libs.permissions import (ROLES, ROLES_ORDERED, DataEntryMinorRole,
+                                      DataEntryOnlyRole, DataEntryRole,
+                                      EditorMinorRole, EditorRole, ManagerRole,
+                                      OwnerRole, get_role, get_role_in_org,
+                                      get_team_project_default_permissions,
+                                      is_organization)
 from onadata.libs.serializers.project_serializer import ProjectSerializer
 from onadata.libs.utils.api_export_tools import (
-    custom_response_handler,
-    get_metadata_format,
-)
-from onadata.libs.utils.cache_tools import (
-    PROJ_BASE_FORMS_CACHE,
-    PROJ_FORMS_CACHE,
-    PROJ_NUM_DATASET_CACHE,
-    PROJ_OWNER_CACHE,
-    PROJ_SUB_DATE_CACHE,
-    reset_project_cache,
-    safe_delete,
-)
+    custom_response_handler, get_entity_list_export_response,
+    get_metadata_format)
+from onadata.libs.utils.cache_tools import (ORG_PROFILE_CACHE,
+                                            PROJ_BASE_FORMS_CACHE,
+                                            PROJ_FORMS_CACHE,
+                                            PROJ_NUM_DATASET_CACHE,
+                                            PROJ_OWNER_CACHE,
+                                            PROJ_SUB_DATE_CACHE,
+                                            XFORM_LIST_CACHE,
+                                            reset_project_cache, safe_delete)
 from onadata.libs.utils.common_tags import MEMBERS, XFORM_META_PERMS
-from onadata.libs.utils.logger_tools import (
-    publish_form,
-    response_with_mimetype_and_name,
-)
-from onadata.libs.utils.project_utils import (
-    set_project_perms_to_xform,
-    set_project_perms_to_xform_async,
-)
-from onadata.libs.utils.user_auth import (
-    check_and_set_form_by_id,
-    check_and_set_form_by_id_string,
-)
+from onadata.libs.utils.logger_tools import (publish_form,
+                                             response_with_mimetype_and_name)
+from onadata.libs.utils.model_tools import queryset_iterator
+from onadata.libs.utils.project_utils import (set_project_perms_to_xform,
+                                              set_project_perms_to_xform_async)
+from onadata.libs.utils.user_auth import (check_and_set_form_by_id,
+                                          check_and_set_form_by_id_string)
 
 DECIMAL_PRECISION = 2
 
@@ -159,17 +144,13 @@ def create_organization_object(org_name, creator, attrs=None):
         username=org_name,
         first_name=first_name,
         last_name=last_name,
-        email=email,
         is_active=getattr(settings, "ORG_ON_CREATE_IS_ACTIVE", True),
     )
     new_user.save()
     try:
-        registration_profile = RegistrationProfile.objects.create_profile(new_user)
+        RegistrationProfile.objects.create_profile(new_user)
     except IntegrityError as e:
         raise ValidationError(_(f"{org_name} already exists")) from e
-    if email:
-        site = Site.objects.get(pk=settings.SITE_ID)
-        registration_profile.send_activation_email(site)
     profile = OrganizationProfile(
         user=new_user,
         name=name,
@@ -180,12 +161,20 @@ def create_organization_object(org_name, creator, attrs=None):
         organization=attrs.get("organization", ""),
         home_page=attrs.get("home_page", ""),
         twitter=attrs.get("twitter", ""),
+        email=email,
     )
     return profile
 
 
 def remove_user_from_organization(organization, user):
-    """Remove a user from an organization"""
+    """Remove a user from an organization
+
+    Remove user from organization and all projects in the organization
+
+    :param organization: OrganizationProfile instance
+    :param user: User instance
+    :return: None
+    """
     team = get_organization_members_team(organization)
     remove_user_from_team(team, user)
     owners_team = get_or_create_organization_owners_team(organization)
@@ -199,9 +188,19 @@ def remove_user_from_organization(organization, user):
         role_cls.remove_obj_permissions(user, organization)
         role_cls.remove_obj_permissions(user, organization.userprofile_ptr)
 
+    # Invalidate organization cache
+    invalidate_organization_cache(organization.user.username)
+
+    # Avoid cyclic dependency errors
+    api_tasks = importlib.import_module("onadata.apps.api.tasks")
+
     # Remove user from all org projects
-    for project in organization.user.project_org.all():
-        ShareProject(project, user.username, role, remove=True).save()
+    project_qs = organization.user.project_org.all()
+
+    for project in queryset_iterator(project_qs):
+        api_tasks.share_project_async.delay(
+            project.pk, user.username, role, remove=True
+        )
 
 
 def remove_user_from_team(team, user):
@@ -223,11 +222,63 @@ def remove_user_from_team(team, user):
             remove_perm(perm.codename, user, members_team)
 
 
-def add_user_to_organization(organization, user):
-    """Add a user to an organization"""
+def add_user_to_organization(organization, user, role=None):
+    """Add a user to an organization
+
+    Add user to organization and all projects in the organization
+
+    :param organization: OrganizationProfile instance
+    :param user: User instance
+    :param role: Role name
+    :return: None
+    """
 
     team = get_organization_members_team(organization)
     add_user_to_team(team, user)
+
+    if role is not None:
+        role_cls = ROLES.get(role)
+        role_cls.add(user, organization)
+
+        owners_team = get_or_create_organization_owners_team(organization)
+
+        if role == OwnerRole.name:
+            role_cls.add(user, organization.userprofile_ptr)
+            # Add user to their respective team
+            add_user_to_team(owners_team, user)
+
+        else:
+            remove_user_from_team(owners_team, user)
+            OwnerRole.remove_obj_permissions(user, organization.userprofile_ptr)
+
+    # Invalidate organization cache
+    invalidate_organization_cache(organization.user.username)
+
+    # Avoid cyclic dependency errors
+    api_tasks = importlib.import_module("onadata.apps.api.tasks")
+
+    # Share all organization projects with the new user
+    project_qs = organization.user.project_org.all()
+
+    if role == OwnerRole.name:
+        # New owners have owner role on all projects
+        for project in queryset_iterator(project_qs):
+            api_tasks.share_project_async.delay(project.pk, user.username, role)
+
+    else:
+        # New members & managers gain default team permissions on projects
+        team = get_organization_members_team(organization)
+
+        for project in queryset_iterator(project_qs):
+            if role == ManagerRole.name and project.created_by == user:
+                # New managers are only granted the manager role on the
+                # projects they created
+                api_tasks.share_project_async.delay(project.pk, user.username, role)
+            else:
+                project_role = get_team_project_default_permissions(team, project)
+                api_tasks.share_project_async.delay(
+                    project.pk, user.username, project_role
+                )
 
 
 def get_organization_members(organization):
@@ -257,8 +308,7 @@ def create_organization_project(organization, project_name, created_by):
     """Creates a project for a given organization
     :param organization: User organization
     :param project_name
-    :param created_by: User with permissions to create projects within the
-                       organization
+    :param created_by: User with permissions to create projects within the organization
 
     :returns: a Project instance
     """
@@ -302,7 +352,7 @@ def publish_xlsform(request, owner, id_string=None, project=None):
     return survey
 
 
-# pylint: disable=too-many-arguments
+# pylint: disable=too-many-arguments, too-many-positional-arguments
 def do_publish_xlsform(user, post, files, owner, id_string=None, project=None):
     """
     Publishes XLSForm.
@@ -401,15 +451,14 @@ def publish_project_xform(request, project):
                 xform.save()
         except IntegrityError as e:
             raise exceptions.ParseError(_(msg)) from e
-        else:
-            # First assign permissions to the person who uploaded the form
-            OwnerRole.add(request.user, xform)
-            try:
-                # Next run async task to apply all other perms
-                set_project_perms_to_xform_async.delay(xform.pk, project.pk)
-            except OperationalError:
-                # Apply permissions synchrounously
-                set_project_perms_to_xform(xform, project)
+        # First assign permissions to the person who uploaded the form
+        OwnerRole.add(request.user, xform)
+        try:
+            # Next run async task to apply all other perms
+            set_project_perms_to_xform_async.delay(xform.pk, project.pk)
+        except OperationalError:
+            # Apply permissions synchrounously
+            set_project_perms_to_xform(xform, project)
     else:
         xform = publish_form(set_form)
 
@@ -519,6 +568,8 @@ def get_media_file_response(metadata, request=None):
             model = DataView
         elif value.startswith("xform"):
             model = XForm
+        elif value.startswith("entity_list"):
+            model = EntityList
 
         if model:
             parts = value.split()
@@ -533,7 +584,7 @@ def get_media_file_response(metadata, request=None):
         file_path = metadata.data_file.name
         filename, extension = os.path.splitext(file_path.split("/")[-1])
         extension = extension.strip(".")
-        dfs = get_storage_class()()
+        dfs = storages["default"]
 
         if dfs.exists(file_path):
             response = response_with_mimetype_and_name(
@@ -552,9 +603,12 @@ def get_media_file_response(metadata, request=None):
     except ValidationError:
         obj, filename = get_data_value_objects(metadata.data_value)
         if obj:
+            if isinstance(obj, EntityList):
+                return get_entity_list_export_response(request, obj, filename)
+
+            export_type = get_metadata_format(metadata.data_value)
             dataview = obj if isinstance(obj, DataView) else False
             xform = obj.xform if isinstance(obj, DataView) else obj
-            export_type = get_metadata_format(metadata.data_value)
 
             return custom_response_handler(
                 request,
@@ -654,7 +708,9 @@ def get_xform_users(xform):
     """
     data = {}
     org_members = []
-    for perm in xform.xformuserobjectpermission_set.all():
+    xform_user_obj_perm_qs = xform.xformuserobjectpermission_set.all()
+
+    for perm in queryset_iterator(xform_user_obj_perm_qs):
         if perm.user not in data:
             user = perm.user
 
@@ -739,7 +795,6 @@ def update_role_by_meta_xform_perms(xform):
         users = get_xform_users(xform)
 
         for user in users:
-
             role = users.get(user).get("role")
             if role in editor_role:
                 role = ROLES.get(meta_perms[0])
@@ -750,9 +805,15 @@ def update_role_by_meta_xform_perms(xform):
                 role.add(user, xform)
 
 
-def replace_attachment_name_with_url(data):
+def get_host_domain(request):
+    """Get host from reques or check the Site model"""
+    request_host = request and request.get_host()
+    return request_host or Site.objects.get_current().domain
+
+
+def replace_attachment_name_with_url(data, request):
     """Replaces the attachment filename with a URL in ``data`` object."""
-    site_url = Site.objects.get_current().domain
+    site_url = get_host_domain(request)
 
     for record in data:
         attachments: dict = record.json.get("_attachments")
@@ -773,3 +834,105 @@ def replace_attachment_name_with_url(data):
                 except ValueError:
                     pass
     return data
+
+
+ENKETO_AUTH_COOKIE = getattr(settings, "ENKETO_AUTH_COOKIE", "__enketo")
+ENKETO_META_UID_COOKIE = getattr(
+    settings, "ENKETO_META_UID_COOKIE", "__enketo_meta_uid"
+)
+ENKETO_META_USERNAME_COOKIE = getattr(
+    settings, "ENKETO_META_USERNAME_COOKIE", "__enketo_meta_username"
+)
+
+
+def set_enketo_signed_cookies(resp, username=None, json_web_token=None):
+    """Set signed cookies for JWT token in the HTTPResponse resp object."""
+    if not username and not json_web_token:
+        return None
+
+    max_age = 30 * 24 * 60 * 60 * 1000
+    enketo_meta_uid = {"max_age": max_age, "salt": settings.ENKETO_API_SALT}
+    enketo = {"secure": False, "salt": settings.ENKETO_API_SALT}
+
+    # add domain attribute if ENKETO_AUTH_COOKIE_DOMAIN is set in settings
+    # i.e. don't add in development environment because cookie automatically
+    # assigns 'localhost' as domain
+    if getattr(settings, "ENKETO_AUTH_COOKIE_DOMAIN", None):
+        enketo_meta_uid["domain"] = settings.ENKETO_AUTH_COOKIE_DOMAIN
+        enketo["domain"] = settings.ENKETO_AUTH_COOKIE_DOMAIN
+
+    resp.set_signed_cookie(ENKETO_META_UID_COOKIE, username, **enketo_meta_uid)
+    resp.set_signed_cookie(ENKETO_META_USERNAME_COOKIE, username, **enketo_meta_uid)
+    resp.set_signed_cookie(ENKETO_AUTH_COOKIE, json_web_token, **enketo)
+
+    return resp
+
+
+def get_org_profile_cache_key(user, organization):
+    """Return cache key given user and organization profile"""
+    org_username = organization.user.username
+
+    if user.is_anonymous:
+        return f"{ORG_PROFILE_CACHE}{org_username}-anon"
+
+    user_role = get_role_in_org(user, organization)
+
+    return f"{ORG_PROFILE_CACHE}{org_username}-{user_role}"
+
+
+def invalidate_organization_cache(org_username):
+    """Set organization cache to none for all roles"""
+    for role in ROLES_ORDERED:
+        key = f"{ORG_PROFILE_CACHE}{org_username}-{role.name}"
+        safe_delete(key)
+
+    safe_delete(f"{ORG_PROFILE_CACHE}{org_username}-anon")
+
+
+def _get_xform_list_cache_key_prefix(xform_or_project):
+    """Get the cache key prefix for the XForm list by user's role
+
+    :param xform_or_project: XForm or Project being accessed
+    :return: cache key prefix based on role assigned to form/project
+    """
+    object_type = type(xform_or_project).__name__
+    return f"{XFORM_LIST_CACHE}{xform_or_project.id}-{object_type}"
+
+
+def get_xform_list_cache_key(user, xform_or_project):
+    """Get the cache key for the XForm list by user's role
+
+    :param user: User making request
+    :param xform_or_project: XForm or Project being accessed
+    :return: cache key based on role assigned to form/project
+    """
+    cache_key_prefix = _get_xform_list_cache_key_prefix(xform_or_project)
+    anonymous_user_key = f"{cache_key_prefix}-anon"
+
+    if user.is_anonymous:
+        return anonymous_user_key
+
+    perms = get_perms(user, xform_or_project)
+    user_role = get_role(perms, xform_or_project)
+
+    if user_role is None:
+        return anonymous_user_key
+
+    return f"{cache_key_prefix}-{user_role}"
+
+
+def invalidate_xform_list_cache(xform):
+    """Invalidate the cache for the XForm list by user's role
+
+    :param xform: XForm instance
+    :return: None
+    """
+    xform_cache_key_prefix = _get_xform_list_cache_key_prefix(xform)
+    project_cache_key_prefix = _get_xform_list_cache_key_prefix(xform.project)
+
+    for role in ROLES_ORDERED:
+        safe_delete(f"{xform_cache_key_prefix}-{role.name}")
+        safe_delete(f"{project_cache_key_prefix}-{role.name}")
+
+    safe_delete(f"{xform_cache_key_prefix}-anon")
+    safe_delete(f"{project_cache_key_prefix}-anon")

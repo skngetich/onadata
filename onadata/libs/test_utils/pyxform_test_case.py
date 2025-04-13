@@ -5,21 +5,18 @@ PyxformTestCase base class using markdown to define the XLSForm.
 import codecs
 import logging
 import os
-import re
 import tempfile
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from unittest import TestCase
 
 from lxml import etree
-
 from pyxform.builder import create_survey_element_from_dict
+from pyxform.constants import NSMAP
 from pyxform.errors import PyXFormError
-from pyxform.utils import NSMAP
 from pyxform.validators.odk_validate import ODKValidateError, check_xform
 from pyxform.xls2json import workbook_to_json
-
-from onadata.libs.test_utils.md_table import md_table_to_ss_structure
+from pyxform.xls2json_backends import DefinitionData, md_to_dict
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.StreamHandler())
@@ -45,11 +42,11 @@ class MatcherContext:
 
     debug: bool
     nsmap_xpath: "Dict[str, str]"
-    nsmap_subs: "NSMAPSubs"
+    nsmap_subs: "NSMAPSubs"  # noqa: F821
     content_str: str
 
 
-class PyxformMarkdown:
+class PyxformMarkdown:  # pylint: disable=too-few-public-methods
     """Transform markdown formatted XLSForm to a pyxform survey object"""
 
     def md_to_pyxform_survey(self, md_raw, kwargs=None, autoname=True, warnings=None):
@@ -58,52 +55,17 @@ class PyxformMarkdown:
             kwargs = {}
         if autoname:
             kwargs = self._autoname_inputs(kwargs)
-        _md = []
-        for line in md_raw.split("\n"):
-            if re.match(r"^\s+#", line):
-                # ignore lines which start with pound sign
-                continue
-            if re.match(r"^(.*)(#[^|]+)$", line):
-                # keep everything before the # outside of the last occurrence
-                # of |
-                _md.append(re.match(r"^(.*)(#[^|]+)$", line).groups()[0].strip())
-            else:
-                _md.append(line.strip())
-        md = "\n".join(_md)  # pylint: disable=invalid-name
-
-        if kwargs.get("debug"):
-            logger.debug(md)
-
-        def list_to_dicts(arr):
-            headers = arr[0]
-
-            def _row_to_dict(row):
-                out_dict = {}
-                for i, col in enumerate(row):
-                    if col not in [None, ""]:
-                        out_dict[headers[i]] = col
-                return out_dict
-
-            return [_row_to_dict(r) for r in arr[1:]]
-
-        sheets = {}
-        for sheet, contents in md_table_to_ss_structure(md):
-            sheets[sheet] = list_to_dicts(contents)
-
-        return self._ss_structure_to_pyxform_survey(sheets, kwargs, warnings=warnings)
-
-    @staticmethod
-    def _ss_structure_to_pyxform_survey(ss_structure, kwargs, warnings=None):
-        # using existing methods from the builder
-        imported_survey_json = workbook_to_json(ss_structure, warnings=warnings)
-        # ideally, when all these tests are working, this would be
-        # refactored as well
-        survey = create_survey_element_from_dict(imported_survey_json)
-        survey.name = kwargs.get("name", "data")
-        survey.title = kwargs.get("title")
-        survey.id_string = kwargs.get("id_string")
-
-        return survey
+        workbook_json = workbook_to_json(
+            DefinitionData(
+                fallback_form_name=kwargs.get("name", "data"), **md_to_dict(md_raw)
+            ),
+            form_name=kwargs.get("name", "data"),
+            fallback_form_name=kwargs.get("name", "data"),
+            warnings=warnings,
+        )
+        if "id_string" in kwargs:
+            workbook_json["id_string"] = kwargs["id_string"]
+        return create_survey_element_from_dict(workbook_json)
 
     @staticmethod
     def _run_odk_validate(xml):
@@ -155,9 +117,6 @@ class PyxformTestCase(PyxformMarkdown, TestCase):
           * md: (str) a markdown formatted xlsform (easy to read in code)
                 [consider a plugin to help with formatting md tables,
                  e.g. https://github.com/vkocubinsky/SublimeTableEditor]
-          * ss_structure: (dict) a python dictionary with sheets and their
-                contents. best used in cases where testing whitespace and
-                cells' type is important
           * survey: (pyxform.survey.Survey) easy for reuse within a test
           # Note: XLS is not implemented at this time. You can use builder to
           create a pyxform Survey object
@@ -224,13 +183,6 @@ class PyxformTestCase(PyxformMarkdown, TestCase):
                 kwargs = self._autoname_inputs(kwargs)
                 survey = self.md_to_pyxform_survey(
                     kwargs.get("md"), kwargs, warnings=warnings
-                )
-            elif "ss_structure" in kwargs:
-                kwargs = self._autoname_inputs(kwargs)
-                survey = self._ss_structure_to_pyxform_survey(
-                    kwargs.get("ss_structure"),
-                    kwargs,
-                    warnings=warnings,
                 )
             else:
                 survey = kwargs.get("survey")
@@ -399,7 +351,7 @@ class PyxformTestCase(PyxformMarkdown, TestCase):
         if "warnings_count" in kwargs:
             c = kwargs.get("warnings_count")
             if not isinstance(c, int):
-                PyxformTestError("warnings_count must be an integer.")
+                raise PyxformTestError("warnings_count must be an integer.")
             self.assertEqual(c, len(warnings))
 
     @staticmethod
@@ -545,7 +497,7 @@ def reorder_attributes(root):
 
 
 def xpath_clean_result_strings(
-    nsmap_subs: "NSMAPSubs", results: "Set[_Element]"
+    nsmap_subs: "NSMAPSubs", results: "Set[_Element]"  # noqa: F821
 ) -> "Set[str]":
     """
     Clean XPath results: stringify, remove namespace declarations, clean up whitespace.
@@ -586,9 +538,9 @@ def xpath_evaluate(
     """
     try:
         results = content.xpath(xpath, namespaces=matcher_context.nsmap_xpath)
-    except etree.XPathEvalError as e:
-        msg = f"Error processing XPath: {xpath}\n" + "\n".join(e.args)
-        raise PyxformTestError(msg) from e
+    except etree.XPathEvalError as error:
+        msg = f"Error processing XPath: {xpath}\n" + "\n".join(error.args)
+        raise PyxformTestError(msg) from error
     if matcher_context.debug:
         if 0 == len(results):
             logger.debug("Results for XPath: %s\n(No matches)\n", xpath)

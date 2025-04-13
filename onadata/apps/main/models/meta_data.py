@@ -2,13 +2,17 @@
 """
 MetaData model
 """
+
 from __future__ import unicode_literals
 
+import hashlib
+import importlib
+import json
 import logging
 import mimetypes
 import os
+from collections import OrderedDict
 from contextlib import closing
-import hashlib
 
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey
@@ -23,8 +27,13 @@ from django.utils import timezone
 
 import requests
 
-from onadata.libs.utils.cache_tools import XFORM_METADATA_CACHE, safe_delete
+from onadata.libs.utils.cache_tools import (
+    XFORM_MANIFEST_CACHE,
+    XFORM_METADATA_CACHE,
+    safe_delete,
+)
 from onadata.libs.utils.common_tags import (
+    EXPORT_COLUMNS_REGISTER,
     GOOGLE_SHEET_DATA_TYPE,
     TEXTIT,
     TEXTIT_DETAILS,
@@ -36,6 +45,8 @@ CHUNK_SIZE = 1024
 INSTANCE_MODEL_NAME = "instance"
 PROJECT_MODEL_NAME = "project"
 XFORM_MODEL_NAME = "xform"
+
+DEFAULT_REQUEST_TIMEOUT = getattr(settings, "DEFAULT_REQUEST_TIMEOUT", 30)
 
 
 def is_valid_url(uri):
@@ -91,13 +102,22 @@ def get_default_content_type():
     return content_object.id
 
 
-def unique_type_for_form(content_object, data_type, data_value=None, data_file=None):
+def unique_type_for_form(
+    content_object, data_type, data_value=None, data_file=None, extra_data=None
+):
     """
     Ensure that each metadata object has unique xform and data_type fields
 
     return the metadata object
     """
-    defaults = {"data_value": data_value} if data_value else {}
+    defaults = {}
+
+    if data_value:
+        defaults["data_value"] = data_value
+
+    if extra_data:
+        defaults["extra_data"] = extra_data
+
     content_type = ContentType.objects.get_for_model(content_object)
 
     if data_value is None and data_file is None:
@@ -106,12 +126,19 @@ def unique_type_for_form(content_object, data_type, data_value=None, data_file=N
             object_id=content_object.id, content_type=content_type, data_type=data_type
         ).first()
     else:
-        result, _created = MetaData.objects.update_or_create(
+        result, metadata_created = MetaData.objects.update_or_create(
             object_id=content_object.id,
             content_type=content_type,
             data_type=data_type,
             defaults=defaults,
         )
+
+        # Force Django to recognize changes to extra_data by ensuring it always updates
+        # During update, Django skips updating extra_data since it thinks the value
+        # hasn't changed
+        if not metadata_created and extra_data:
+            result.extra_data = extra_data
+            result.save()
 
     if data_file:
         if result.data_value is None or result.data_value == "":
@@ -139,7 +166,9 @@ def create_media(media):
         filename = media.data_value.split("/")[-1]
         data_file = NamedTemporaryFile()
         content_type = mimetypes.guess_type(filename)
-        with closing(requests.get(media.data_value, stream=True)) as resp:
+        with closing(
+            requests.get(media.data_value, stream=True, timeout=DEFAULT_REQUEST_TIMEOUT)
+        ) as resp:
             # pylint: disable=no-member
             for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
                 if chunk:
@@ -204,6 +233,9 @@ class MetaData(models.Model):
     class Meta:
         app_label = "main"
         unique_together = ("object_id", "data_type", "data_value", "content_type")
+        indexes = [
+            models.Index(fields=["object_id", "data_type"]),
+        ]
 
     # pylint: disable=arguments-differ
     def save(self, *args, **kwargs):
@@ -235,7 +267,7 @@ class MetaData(models.Model):
             try:
                 self.data_file.seek(os.SEEK_SET)
             except IOError:
-                return ""
+                pass
             else:
                 file_hash = hashlib.new(
                     "md5", self.data_file.read(), usedforsecurity=False
@@ -253,6 +285,13 @@ class MetaData(models.Model):
         """
         soft_deletion_time = timezone.now()
         self.deleted_at = soft_deletion_time
+        self.save()
+
+    def restore(self):
+        """
+        Restore the MetaData by setting the deleted_at field to None.
+        """
+        self.deleted_at = None
         self.save()
 
     @staticmethod
@@ -555,6 +594,27 @@ class MetaData(models.Model):
         data_type = "imported_via_csv_by"
         return unique_type_for_form(content_object, data_type, data_value)
 
+    @staticmethod
+    def update_or_create_export_register(content_object, data_value=None):
+        """Update or create export columns register for XForm."""
+        # Avoid cyclic import by using importlib
+        csv_builder = importlib.import_module("onadata.libs.utils.csv_builder")
+        ordered_columns = OrderedDict()
+        # pylint: disable=protected-access
+        csv_builder.CSVDataFrameBuilder._build_ordered_columns(
+            content_object._get_survey(), ordered_columns
+        )
+        serialized_columns = json.dumps(ordered_columns)
+        data_type = EXPORT_COLUMNS_REGISTER
+        extra_data = {
+            "merged_multiples": serialized_columns,
+            "split_multiples": serialized_columns,
+        }
+        data_value = "" if data_value is None else data_value
+        return unique_type_for_form(
+            content_object, data_type, data_value=data_value, extra_data=extra_data
+        )
+
 
 # pylint: disable=unused-argument,invalid-name
 def clear_cached_metadata_instance_object(
@@ -563,7 +623,11 @@ def clear_cached_metadata_instance_object(
     """
     Clear the cache for the metadata object.
     """
-    safe_delete(f"{XFORM_METADATA_CACHE}{instance.object_id}")
+    xform_id = instance.object_id
+    safe_delete(f"{XFORM_METADATA_CACHE}{xform_id}")
+
+    if instance.data_type == "media":
+        safe_delete(f"{XFORM_MANIFEST_CACHE}{xform_id}")
 
 
 # pylint: disable=unused-argument

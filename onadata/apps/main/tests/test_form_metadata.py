@@ -2,6 +2,7 @@
 """
 Test form MetaData objects.
 """
+
 import hashlib
 import os
 from builtins import open
@@ -15,11 +16,11 @@ from django.urls import reverse
 from onadata.apps.main.models import MetaData
 from onadata.apps.main.tests.test_base import TestBase
 from onadata.apps.main.views import (
-    show,
-    edit,
-    download_metadata,
-    download_media_data,
     delete_metadata,
+    download_media_data,
+    download_metadata,
+    edit,
+    show,
 )
 from onadata.libs.utils.cache_tools import XFORM_METADATA_CACHE
 
@@ -64,7 +65,11 @@ class TestFormMetadata(TestBase):
                 },
             )
         else:
-            self.doc = MetaData.objects.all().reverse()[0]
+            self.doc = (
+                MetaData.objects.all()
+                .exclude(data_type="export_columns_register")
+                .reverse()[0]
+            )
             self.doc_url = reverse(
                 download_metadata,
                 kwargs={
@@ -194,7 +199,7 @@ class TestFormMetadata(TestBase):
         response = self.client.get(self.doc_url)
         self.assertEqual(response.status_code, 200)
         fileName, ext = os.path.splitext(response["Content-Disposition"])
-        self.assertEqual(ext, ".xlsx")
+        self.assertEqual(ext, '.xlsx"')
 
     def test_no_download_supporting_doc_for_anon(self):
         self._add_metadata()
@@ -206,7 +211,7 @@ class TestFormMetadata(TestBase):
         response = self.client.get(self.doc_url)
         self.assertEqual(response.status_code, 200)
         fileName, ext = os.path.splitext(response["Content-Disposition"])
-        self.assertEqual(ext, ".png")
+        self.assertEqual(ext, '.png"')
 
     def test_shared_download_supporting_doc_for_anon(self):
         self._add_metadata()

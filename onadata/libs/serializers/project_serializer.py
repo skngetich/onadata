@@ -2,30 +2,22 @@
 """
 Project Serializer module.
 """
+
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.core.management import call_command
 from django.db.utils import IntegrityError
 from django.utils.translation import gettext as _
 
 from rest_framework import serializers
 from six import itervalues
 
-from onadata.apps.api.models.organization_profile import (
-    OrganizationProfile,
-    get_or_create_organization_owners_team,
-    get_organization_members_team,
-)
-from onadata.apps.main.models.user_profile import UserProfile
+from onadata.apps.api.models.organization_profile import OrganizationProfile
 from onadata.apps.logger.models.project import Project
 from onadata.apps.logger.models.xform import XForm
-from onadata.libs.permissions import (
-    ManagerRole,
-    OwnerRole,
-    ReadOnlyRole,
-    get_role,
-    is_organization,
-)
+from onadata.apps.main.models.user_profile import UserProfile
+from onadata.libs.permissions import ManagerRole, OwnerRole, get_role, is_organization
 from onadata.libs.serializers.fields.json_field import JsonField
 from onadata.libs.serializers.tag_list_serializer import TagListSerializer
 from onadata.libs.utils.analytics import TrackObjectEvent
@@ -218,15 +210,58 @@ class BaseProjectXFormSerializer(serializers.HyperlinkedModelSerializer):
 
     formid = serializers.ReadOnlyField(source="id")
     name = serializers.ReadOnlyField(source="title")
+    contributes_entities_to = serializers.SerializerMethodField()
+    consumes_entities_from = serializers.SerializerMethodField()
+
+    def get_contributes_entities_to(self, obj: XForm):
+        """Return the EntityList that the form contributes Entities to"""
+        registration_form = obj.registration_forms.filter(
+            entity_list__deleted_at__isnull=True
+        ).first()
+
+        if registration_form is None:
+            return None
+
+        return {
+            "id": registration_form.entity_list.pk,
+            "name": registration_form.entity_list.name,
+            "is_active": registration_form.is_active,
+        }
+
+    def get_consumes_entities_from(self, obj: XForm):
+        """Return the EntityLIst that the form consumes Entities"""
+        queryset = obj.follow_up_forms.filter(entity_list__deleted_at__isnull=True)
+
+        if not queryset:
+            return []
+
+        return list(
+            map(
+                lambda follow_up_form: {
+                    "id": follow_up_form.entity_list.pk,
+                    "name": follow_up_form.entity_list.name,
+                    "is_active": follow_up_form.is_active,
+                },
+                queryset,
+            )
+        )
 
     # pylint: disable=too-few-public-methods,missing-class-docstring
     class Meta:
         model = XForm
-        fields = ("name", "formid", "id_string", "is_merged_dataset")
+        fields = (
+            "name",
+            "formid",
+            "id_string",
+            "is_merged_dataset",
+            "encrypted",
+            "contributes_entities_to",
+            "consumes_entities_from",
+        )
 
 
 # pylint: disable=too-few-public-methods
-class ProjectXFormSerializer(serializers.HyperlinkedModelSerializer):
+class ProjectXFormSerializer(BaseProjectXFormSerializer):
     """
     ProjectXFormSerializer class - to return project xform info.
     """
@@ -254,6 +289,8 @@ class ProjectXFormSerializer(serializers.HyperlinkedModelSerializer):
             "url",
             "last_updated_at",
             "is_merged_dataset",
+            "contributes_entities_to",
+            "consumes_entities_from",
         )
 
     def get_published_by_formbuilder(self, obj):
@@ -473,9 +510,8 @@ class ProjectSerializer(serializers.HyperlinkedModelSerializer):
             json_val = JsonField.to_json(value)
         except ValueError as e:
             raise serializers.ValidationError(msg) from e
-        else:
-            if json_val is None:
-                raise serializers.ValidationError(msg)
+        if json_val is None:
+            raise serializers.ValidationError(msg)
         return value
 
     def update(self, instance, validated_data):
@@ -497,23 +533,12 @@ class ProjectSerializer(serializers.HyperlinkedModelSerializer):
             set_owners_permission(owner, instance)
 
             if is_organization(owner.profile):
-                owners_team = get_or_create_organization_owners_team(owner.profile)
-                members_team = get_organization_members_team(owner.profile)
-                OwnerRole.add(owners_team, instance)
-                ReadOnlyRole.add(members_team, instance)
-                owners = owners_team.user_set.all()
-                # Owners are also members
-                members = members_team.user_set.exclude(
-                    username__in=[user.username for user in owners]
+                call_command(
+                    "transferproject",
+                    current_owner=instance.organization,
+                    new_owner=owner,
+                    project_id=instance.pk,
                 )
-                # Exclude new owner if in members
-                members = members.exclude(username=owner.username)
-
-                # Add permissions to all users in Owners and Members team
-                for owner in owners:
-                    OwnerRole.add(owner, instance)
-                for member in members:
-                    ReadOnlyRole.add(member, instance)
 
             # clear cache
             safe_delete(f"{PROJ_PERM_CACHE}{instance.pk}")
@@ -553,15 +578,14 @@ class ProjectSerializer(serializers.HyperlinkedModelSerializer):
             raise serializers.ValidationError(
                 "The fields name, organization must make a unique set."
             ) from e
-        else:
-            project.xform_set.exclude(shared=project.shared).update(
-                shared=project.shared, shared_data=project.shared
-            )
-            request = self.context.get("request")
-            serializer = ProjectSerializer(project, context={"request": request})
-            response = serializer.data
-            cache.set(f"{PROJ_OWNER_CACHE}{project.pk}", response)
-            return project
+        project.xform_set.exclude(shared=project.shared).update(
+            shared=project.shared, shared_data=project.shared
+        )
+        request = self.context.get("request")
+        serializer = ProjectSerializer(project, context={"request": request})
+        response = serializer.data
+        cache.set(f"{PROJ_OWNER_CACHE}{project.pk}", response)
+        return project
 
     def get_users(self, obj):
         """

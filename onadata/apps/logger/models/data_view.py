@@ -2,6 +2,7 @@
 """
 DataView model class
 """
+
 import datetime
 import json
 
@@ -9,9 +10,9 @@ from django.conf import settings
 from django.contrib.gis.db import models
 from django.db import connection
 from django.db.models.signals import post_delete, post_save
+from django.db.utils import DataError
 from django.utils import timezone
 from django.utils.translation import gettext as _
-from django.db.utils import DataError
 
 from onadata.apps.viewer.parsed_instance_tools import get_where_clause
 from onadata.libs.models.sorting import (  # noqa pylint: disable=unused-import
@@ -22,8 +23,8 @@ from onadata.libs.models.sorting import (  # noqa pylint: disable=unused-import
 from onadata.libs.utils.cache_tools import (  # noqa pylint: disable=unused-import
     DATAVIEW_COUNT,
     DATAVIEW_LAST_SUBMISSION_TIME,
-    XFORM_LINKED_DATAVIEWS,
     PROJ_OWNER_CACHE,
+    XFORM_LINKED_DATAVIEWS,
     safe_delete,
 )
 from onadata.libs.utils.common_tags import (
@@ -36,6 +37,7 @@ from onadata.libs.utils.common_tags import (
     NOTES,
     SUBMISSION_TIME,
 )
+from onadata.libs.utils.common_tools import get_abbreviated_xpath
 
 SUPPORTED_FILTERS = ["=", ">", "<", ">=", "<=", "<>", "!="]
 ATTACHMENT_TYPES = ["photo", "audio", "video"]
@@ -56,10 +58,12 @@ def _json_sql_str(key, known_integers=None, known_dates=None, known_decimals=Non
 
 
 def get_name_from_survey_element(element):
-    return element.get_abbreviated_xpath()
+    """Returns the abbreviated xpath of a given ``SurveyElement``."""
+    return get_abbreviated_xpath(element.get_xpath())
 
 
 def append_where_list(comp, t_list, json_str):
+    """Concatenates an SQL query based on the ``comp`` comparison value."""
     if comp in ["=", ">", "<", ">=", "<="]:
         t_list.append(f"{json_str} {comp}" + " %s")
     elif comp in ["<>", "!="]:
@@ -214,6 +218,19 @@ class DataView(models.Model):
             update_fields.append("deleted_by")
         self.save(update_fields=update_fields)
 
+    def restore(self):
+        """
+        Restore the dataview by removing the timestamped suffix from the name
+        and setting the deleted_at field to None.
+        """
+        if self.deleted_at is not None:
+            self.name = self.name.split("-deleted-at-")[0]
+            self.deleted_at = None
+            self.deleted_by = None
+            self.save(
+                update_fields=["name", "deleted_at", "deleted_by", "date_modified"]
+            )
+
     @classmethod
     def _get_where_clause(  # pylint: disable=too-many-locals
         cls,
@@ -266,6 +283,8 @@ class DataView(models.Model):
 
     @classmethod
     def query_iterator(cls, sql, fields=None, params=None, count=False):
+        """A database query iterator."""
+
         def parse_json(data):
             try:
                 return json.loads(data)
@@ -301,7 +320,8 @@ class DataView(models.Model):
                 for row in cursor.fetchall():
                     yield dict(zip(fields, [parse_json(row[0]).get(f) for f in fields]))
 
-    # pylint: disable=too-many-arguments,too-many-locals,too-many-branches
+    # pylint: disable=too-many-arguments,too-many-positional-arguments
+    # pylint: disable=too-many-locals,too-many-branches
     @classmethod
     def generate_query_string(
         cls,
@@ -313,7 +333,10 @@ class DataView(models.Model):
         sort,
         filter_query=None,
     ):
-        additional_columns = [GEOLOCATION] if data_view.instances_with_geopoints else []
+        """Returns an SQL string based on the passed in parameters."""
+        additional_columns = []
+        if data_view.instances_with_geopoints:
+            additional_columns = [GEOLOCATION]
 
         if has_attachments_fields(data_view):
             additional_columns += [ATTACHMENTS]
@@ -392,7 +415,7 @@ class DataView(models.Model):
         )
 
     @classmethod
-    def query_data(  # pylint: disable=too-many-arguments
+    def query_data(  # pylint: disable=too-many-arguments, too-many-positional-arguments
         cls,
         data_view,
         start_index=None,
@@ -417,8 +440,8 @@ class DataView(models.Model):
 
         try:
             records = list(DataView.query_iterator(sql, columns, params, count))
-        except DataError as e:
-            return {"error": _(str(e))}
+        except DataError as error:
+            return {"error": _(str(error))}
 
         return records
 

@@ -3,8 +3,9 @@
 """
 data views.
 """
+
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from tempfile import NamedTemporaryFile
 from time import strftime, strptime
 from wsgiref.util import FileWrapper
@@ -12,7 +13,7 @@ from wsgiref.util import FileWrapper
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.decorators import login_required
-from django.core.files.storage import FileSystemStorage, get_storage_class
+from django.core.files.storage import FileSystemStorage, storages
 from django.http import (
     HttpResponse,
     HttpResponseBadRequest,
@@ -27,7 +28,6 @@ from django.urls import reverse
 from django.utils.translation import gettext as _
 from django.views.decorators.http import require_POST
 
-import pytz
 import requests
 from dict2xml import dict2xml
 from dpath import util as dpath_util
@@ -46,7 +46,7 @@ from onadata.apps.viewer.tasks import create_async_export
 from onadata.apps.viewer.xls_writer import XlsWriter
 from onadata.libs.exceptions import NoRecordsFoundError
 from onadata.libs.utils.chart_tools import build_chart_data
-from onadata.libs.utils.common_tools import get_uuid
+from onadata.libs.utils.common_tools import get_abbreviated_xpath, get_uuid
 from onadata.libs.utils.export_tools import (
     DEFAULT_GROUP_DELIMITER,
     generate_export,
@@ -55,8 +55,8 @@ from onadata.libs.utils.export_tools import (
     should_create_new_export,
     str_to_bool,
 )
-from onadata.libs.utils.google import create_flow
-from onadata.libs.utils.image_tools import image_url
+from onadata.libs.utils.google_tools import create_flow
+from onadata.libs.utils.image_tools import generate_media_download_url, image_url
 from onadata.libs.utils.log import Actions, audit_log
 from onadata.libs.utils.logger_tools import (
     generate_content_disposition_header,
@@ -73,6 +73,8 @@ from onadata.libs.utils.viewer_tools import (
     get_form,
 )
 
+DEFAULT_REQUEST_TIMEOUT = getattr(settings, "DEFAULT_REQUEST_TIMEOUT", 30)
+
 # pylint: disable=invalid-name
 User = get_user_model()
 
@@ -82,12 +84,12 @@ def _get_start_end_submission_time(request):
     end = None
     try:
         if request.GET.get("start"):
-            start = pytz.timezone("UTC").localize(
-                datetime.strptime(request.GET["start"], "%y_%m_%d_%H_%M_%S")
-            )
+            start = datetime.strptime(
+                request.GET["start"], "%y_%m_%d_%H_%M_%S"
+            ).replace(tzinfo=timezone.utc)
         if request.GET.get("end"):
-            end = pytz.timezone("UTC").localize(
-                datetime.strptime(request.GET["end"], "%y_%m_%d_%H_%M_%S")
+            end = datetime.strptime(request.GET["end"], "%y_%m_%d_%H_%M_%S").replace(
+                tzinfo=timezone.utc
             )
     except ValueError:
         return HttpResponseBadRequest(
@@ -237,7 +239,7 @@ def add_submission_with(request, username, id_string):
             user__username__iexact=username, id_string__iexact=id_string
         )
         return [
-            e.get_abbreviated_xpath()
+            get_abbreviated_xpath(e.get_xpath())
             for e in data_dictionary.get_survey_elements()
             if e.bind.get("type") == "geopoint"
         ]
@@ -275,6 +277,7 @@ def add_submission_with(request, username, id_string):
         url,
         data=payload,
         auth=(settings.ENKETO_API_TOKEN, ""),
+        timeout=DEFAULT_REQUEST_TIMEOUT,
         verify=getattr(settings, "VERIFY_SSL", True),
     )
 
@@ -313,7 +316,12 @@ def data_export(request, username, id_string, export_type):  # noqa C901
 
     audit = {"xform": xform.id_string, "export_type": export_type}
 
-    options = {"extension": extension, "username": username, "id_string": id_string}
+    options = {
+        "extension": extension,
+        "username": username,
+        "id_string": id_string,
+        "host": request.get_host(),
+    }
     if query:
         options["query"] = query
 
@@ -400,7 +408,6 @@ def create_export(request, username, id_string, export_type):
 
     credential = None
     if export_type == Export.GOOGLE_SHEETS_EXPORT:
-
         credential = _get_google_credential(request)
         if isinstance(credential, HttpResponseRedirect):
             return credential
@@ -435,33 +442,34 @@ def create_export(request, username, id_string, export_type):
         "remove_group_name": str_to_bool(remove_group_name),
         "meta": meta.replace(",", "") if meta else None,
         "google_credentials": credential,
+        "host": request.get_host(),
     }
 
     try:
         create_async_export(xform, export_type, query, force_xlsx, options)
     except ExportTypeError:
         return HttpResponseBadRequest(_(f"{export_type} is not a valid export type"))
-    else:
-        audit = {"xform": xform.id_string, "export_type": export_type}
-        id_string = xform.id_string
-        audit_log(
-            Actions.EXPORT_CREATED,
-            request.user,
-            owner,
-            _(f"Created {export_type.upper()} export on '{id_string}'."),
-            audit,
-            request,
+
+    audit = {"xform": xform.id_string, "export_type": export_type}
+    id_string = xform.id_string
+    audit_log(
+        Actions.EXPORT_CREATED,
+        request.user,
+        owner,
+        _(f"Created {export_type.upper()} export on '{id_string}'."),
+        audit,
+        request,
+    )
+    return HttpResponseRedirect(
+        reverse(
+            export_list,
+            kwargs={
+                "username": username,
+                "id_string": id_string,
+                "export_type": export_type,
+            },
         )
-        return HttpResponseRedirect(
-            reverse(
-                export_list,
-                kwargs={
-                    "username": username,
-                    "id_string": id_string,
-                    "export_type": export_type,
-                },
-            )
-        )
+    )
 
 
 def _get_google_credential(request):
@@ -510,6 +518,7 @@ def export_list(request, username, id_string, export_type):  # noqa C901
         "meta": export_meta,
         "token": export_token,
         "google_credentials": credential,
+        "host": request.get_host(),
     }
 
     if should_create_new_export(xform, export_type, options):
@@ -634,7 +643,7 @@ def export_download(request, username, id_string, export_type, filename):
     if request.GET.get("raw"):
         id_string = None
 
-    default_storage = get_storage_class()()
+    default_storage = storages["default"]
     if not isinstance(default_storage, FileSystemStorage):
         return HttpResponseRedirect(default_storage.url(export.filepath))
     basename = os.path.splitext(export.filename)[0]
@@ -866,13 +875,17 @@ def attachment_url(request, size="medium"):
     """
     media_file = request.GET.get("media_file")
     no_redirect = request.GET.get("no_redirect")
-    if not media_file:
-        return HttpResponseNotFound(_("Attachment not found"))
+    attachment_id = request.GET.get("attachment_id")
 
-    result = Attachment.objects.filter(media_file=media_file).order_by()[0:1]
-    if not result:
+    if not media_file and not attachment_id:
         return HttpResponseNotFound(_("Attachment not found"))
-    attachment = result[0]
+    if attachment_id:
+        attachment = get_object_or_404(Attachment, pk=attachment_id)
+    else:
+        result = Attachment.objects.filter(media_file=media_file).order_by()[0:1]
+        if not result:
+            return HttpResponseNotFound(_("Attachment not found"))
+        attachment = result[0]
 
     if size == "original" and no_redirect == "true":
         response = response_with_mimetype_and_name(
@@ -884,7 +897,7 @@ def attachment_url(request, size="medium"):
 
         return response
     if not attachment.mimetype.startswith("image"):
-        return redirect(attachment.media_file.url)
+        return generate_media_download_url(attachment)
     media_url = image_url(attachment, size)
     if media_url:
         return redirect(media_url)
@@ -961,7 +974,7 @@ def charts(request, username, id_string):
 
     summaries = build_chart_data(xform, lang_index, page)
 
-    if request.is_ajax():
+    if request.headers.get("x-requested-with") == "XMLHttpRequest":
         template = "charts_snippet.html"
     else:
         template = "charts.html"

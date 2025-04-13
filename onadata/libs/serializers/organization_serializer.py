@@ -37,6 +37,7 @@ class OrganizationSerializer(serializers.HyperlinkedModelSerializer):
     user = serializers.HyperlinkedRelatedField(
         view_name="user-detail", lookup_field="username", read_only=True
     )
+    email = serializers.EmailField(allow_blank=True)
     creator = serializers.HyperlinkedRelatedField(
         view_name="user-detail", lookup_field="username", read_only=True
     )
@@ -47,7 +48,7 @@ class OrganizationSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = OrganizationProfile
         exclude = ("created_by", "is_organization", "organization")
-        owner_only_fields = ("metadata",)
+        owner_only_fields = ("metadata", "email")
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -70,8 +71,11 @@ class OrganizationSerializer(serializers.HyperlinkedModelSerializer):
             first_name, last_name = _get_first_last_names(validated_data.get("name"))
             instance.user.first_name = first_name
             instance.user.last_name = last_name
-            instance.user.save()
 
+        if "email" in validated_data:
+            instance.email = validated_data.pop("email")
+
+        instance.user.save()
         return super().update(instance, validated_data)
 
     def create(self, validated_data):
@@ -85,6 +89,7 @@ class OrganizationSerializer(serializers.HyperlinkedModelSerializer):
 
         if "request" in self.context:
             creator = self.context["request"].user
+            validated_data["host"] = self.context["request"].get_host()
 
         validated_data["organization"] = org_name
 
@@ -130,13 +135,15 @@ class OrganizationSerializer(serializers.HyperlinkedModelSerializer):
                 except UserProfile.DoesNotExist:
                     profile = UserProfile.objects.create(user=u)
 
-                users_list.append({
-                    "user": u.username,
-                    "role": get_role_in_org(u, obj),
-                    "first_name": u.first_name,
-                    "last_name": u.last_name,
-                    "gravatar": profile.gravatar,
-                })
+                users_list.append(
+                    {
+                        "user": u.username,
+                        "role": get_role_in_org(u, obj),
+                        "first_name": u.first_name,
+                        "last_name": u.last_name,
+                        "gravatar": profile.gravatar,
+                    }
+                )
             return users_list
 
         members = get_organization_members(obj) if obj else []

@@ -2,6 +2,7 @@
 """
 Tests the XForm viewset.
 """
+
 from __future__ import unicode_literals
 
 import codecs
@@ -11,10 +12,11 @@ import os
 import re
 from builtins import open
 from collections import OrderedDict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.client import BadStatusLine
 from io import StringIO
-from xml.dom import Node, minidom
+from unittest.mock import Mock, patch
+from xml.dom import Node
 
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
@@ -25,16 +27,13 @@ from django.http import HttpResponseRedirect
 from django.test.utils import override_settings
 from django.utils.dateparse import parse_datetime
 from django.utils.html import conditional_escape
-from django.utils.timezone import utc
 
 import jwt
+from defusedxml import minidom
 from django_digest.test import DigestAuth
 from flaky import flaky
 from httmock import HTTMock
-from mock import Mock, patch
-from onadata.libs.utils.api_export_tools import get_existing_file_format
 from rest_framework import status
-from rest_framework.viewsets import ModelViewSet
 
 from onadata.apps.api.tests.mocked_data import (
     enketo_error500_mock,
@@ -56,13 +55,13 @@ from onadata.apps.api.tests.viewsets.test_abstract_viewset import (
 )
 from onadata.apps.api.viewsets.project_viewset import ProjectViewSet
 from onadata.apps.api.viewsets.xform_viewset import XFormViewSet
-from onadata.apps.logger.models import Attachment, Instance, Project, XForm
+from onadata.apps.logger.models import Attachment, EntityList, Instance, Project, XForm
 from onadata.apps.logger.models.xform_version import XFormVersion
+from onadata.apps.logger.views import delete_xform
 from onadata.apps.logger.xform_instance_parser import XLSFormError
 from onadata.apps.main.models import MetaData
 from onadata.apps.messaging.constants import FORM_UPDATED, XFORM
 from onadata.apps.viewer.models import Export
-from onadata.apps.viewer.models.export import ExportTypeError
 from onadata.libs.permissions import (
     ROLES_ORDERED,
     DataEntryMinorRole,
@@ -78,6 +77,7 @@ from onadata.libs.serializers.xform_serializer import (
     XFormBaseSerializer,
     XFormSerializer,
 )
+from onadata.libs.utils.api_export_tools import get_existing_file_format
 from onadata.libs.utils.cache_tools import (
     ENKETO_URL_CACHE,
     PROJ_FORMS_CACHE,
@@ -114,21 +114,42 @@ def raise_bad_status_line(arg):
     raise BadStatusLine("RANDOM STATUS")
 
 
-class TestXFormViewSet(TestAbstractViewSet):
-    """Test XFormViewSet"""
+class XFormViewSetBaseTestCase(TestAbstractViewSet):
+    def _make_submission_over_date_range(self, start, days=1):
+        self._publish_xls_form_to_project()
+
+        start_time = start
+        curr_time = start_time
+        for survey in self.surveys:
+            _submission_time = curr_time
+            self._make_submission(
+                os.path.join(
+                    settings.PROJECT_ROOT,
+                    "apps",
+                    "main",
+                    "tests",
+                    "fixtures",
+                    "transportation",
+                    "instances",
+                    survey,
+                    survey + ".xml",
+                ),
+                forced_submission_time=_submission_time,
+            )
+            curr_time += timedelta(days=days)
+
+
+class PublishXLSFormTestCase(XFormViewSetBaseTestCase):
+    """Tests for publishing an XLSForm"""
 
     def setUp(self):
-        super(TestXFormViewSet, self).setUp()
-        self.view = XFormViewSet.as_view(
-            {
-                "get": "list",
-            }
-        )
+        super().setUp()
+
+        self.view = XFormViewSet.as_view({"post": "create"})
 
     def test_form_publishing_arabic(self):
         with HTTMock(enketo_mock):
             xforms = XForm.objects.count()
-            view = XFormViewSet.as_view({"post": "create"})
             path = os.path.join(
                 settings.PROJECT_ROOT,
                 "apps",
@@ -140,11 +161,551 @@ class TestXFormViewSet(TestAbstractViewSet):
             with open(path, "rb") as xls_file:
                 post_data = {"xls_file": xls_file}
                 request = self.factory.post("/", data=post_data, **self.extra)
-                response = view(request)
+                response = self.view(request)
                 self.assertEqual(xforms + 1, XForm.objects.count())
                 self.assertEqual(response.status_code, 201)
 
+    def test_publish_xlsform(self):
+        with HTTMock(enketo_urls_mock):
+            data = {
+                "owner": "http://testserver/api/v1/users/bob",
+                "public": False,
+                "public_data": False,
+                "description": "",
+                "downloadable": True,
+                "allows_sms": False,
+                "encrypted": False,
+                "sms_id_string": "transportation_2011_07_25",
+                "id_string": "transportation_2011_07_25",
+                "title": "transportation_2011_07_25",
+                "bamboo_dataset": "",
+            }
+            path = os.path.join(
+                settings.PROJECT_ROOT,
+                "apps",
+                "main",
+                "tests",
+                "fixtures",
+                "transportation",
+                "transportation.xlsx",
+            )
+
+            with open(path, "rb") as xls_file:
+                post_data = {"xls_file": xls_file}
+                request = self.factory.post("/", data=post_data, **self.extra)
+                response = self.view(request)
+                self.assertEqual(response.status_code, 201)
+                xform = self.user.xforms.get(id_string="transportation_2011_07_25")
+                data.update({"url": "http://testserver/api/v1/forms/%s" % xform.pk})
+
+                self.assertDictContainsSubset(data, response.data)
+                self.assertTrue(OwnerRole.user_has_role(self.user, xform))
+                self.assertEqual("owner", response.data["users"][0]["role"])
+
+                # pylint: disable=no-member
+                self.assertIsNotNone(
+                    MetaData.objects.get(object_id=xform.id, data_type="enketo_url")
+                )
+                self.assertIsNotNone(
+                    MetaData.objects.get(
+                        object_id=xform.id, data_type="enketo_preview_url"
+                    )
+                )
+
+                # Ensure XFormVersion object is created on XForm publish
+                versions_count = XFormVersion.objects.filter(xform=xform).count()
+                self.assertEqual(versions_count, 1)
+
+    def test_publish_xlsforms_with_same_id_string(self):
+        with HTTMock(enketo_urls_mock):
+            counter = XForm.objects.count()
+            data = {
+                "owner": "http://testserver/api/v1/users/bob",
+                "public": False,
+                "public_data": False,
+                "description": "",
+                "downloadable": True,
+                "allows_sms": False,
+                "encrypted": False,
+                "sms_id_string": "transportation_2011_07_25",
+                "id_string": "transportation_2011_07_25",
+                "title": "transportation_2011_07_25",
+                "bamboo_dataset": "",
+            }
+            path = os.path.join(
+                settings.PROJECT_ROOT,
+                "apps",
+                "main",
+                "tests",
+                "fixtures",
+                "transportation",
+                "transportation.xlsx",
+            )
+            with open(path, "rb") as xls_file:
+                post_data = {"xls_file": xls_file}
+                request = self.factory.post("/", data=post_data, **self.extra)
+                response = self.view(request)
+                self.assertEqual(response.status_code, 201)
+                xform = self.user.xforms.all()[0]
+                data.update(
+                    {
+                        "url": "http://testserver/api/v1/forms/%s" % xform.pk,
+                        "has_id_string_changed": False,
+                    }
+                )
+                self.assertDictContainsSubset(data, response.data)
+                self.assertTrue(OwnerRole.user_has_role(self.user, xform))
+                self.assertEqual("owner", response.data["users"][0]["role"])
+
+                # pylint: disable=no-member
+                self.assertIsNotNone(
+                    MetaData.objects.get(object_id=xform.id, data_type="enketo_url")
+                )
+                self.assertIsNotNone(
+                    MetaData.objects.get(
+                        object_id=xform.id, data_type="enketo_preview_url"
+                    )
+                )
+
+            self.assertEqual(counter + 1, XForm.objects.count())
+            path = os.path.join(
+                settings.PROJECT_ROOT,
+                "apps",
+                "main",
+                "tests",
+                "fixtures",
+                "transportation",
+                "transportation_copy.xlsx",
+            )
+
+            with open(path, "rb") as xls_file:
+                post_data = {"xls_file": xls_file}
+                request = self.factory.post("/", data=post_data, **self.extra)
+                response = self.view(request)
+                self.assertEqual(response.status_code, 201)
+                xform = self.user.xforms.get(id_string="Transportation_2011_07_25_1")
+                data.update(
+                    {
+                        "url": "http://testserver/api/v1/forms/%s" % xform.pk,
+                        "id_string": "Transportation_2011_07_25_1",
+                        "title": "Transportation_2011_07_25",
+                        "sms_id_string": "Transportation_2011_07_25",
+                        "has_id_string_changed": True,
+                    }
+                )
+
+                self.assertDictContainsSubset(data, response.data)
+                self.assertTrue(OwnerRole.user_has_role(self.user, xform))
+                self.assertEqual("owner", response.data["users"][0]["role"])
+
+                # pylint: disable=no-member
+                self.assertIsNotNone(
+                    MetaData.objects.get(object_id=xform.id, data_type="enketo_url")
+                )
+                self.assertIsNotNone(
+                    MetaData.objects.get(
+                        object_id=xform.id, data_type="enketo_preview_url"
+                    )
+                )
+
+            xform = XForm.objects.get(id_string="transportation_2011_07_25")
+            self.assertIsInstance(xform, XForm)
+            self.assertEqual(counter + 2, XForm.objects.count())
+
+    # pylint: disable=invalid-name
+    @patch("onadata.apps.main.forms.requests")
+    def test_publish_xlsform_using_url_upload(self, mock_requests):
+        with HTTMock(enketo_mock):
+            xls_url = "https://ona.io/examples/forms/tutorial/form.xlsx"
+            pre_count = XForm.objects.count()
+            path = os.path.join(
+                settings.PROJECT_ROOT,
+                "apps",
+                "main",
+                "tests",
+                "fixtures",
+                "transportation",
+                "transportation_different_id_string.xlsx",
+            )
+
+            with open(path, "rb") as xls_file:
+                mock_response = get_mocked_response_for_file(
+                    xls_file, "transportation_different_id_string.xlsx", 200
+                )
+                mock_requests.head.return_value = mock_response
+                mock_requests.get.return_value = mock_response
+
+                post_data = {"xls_url": xls_url}
+                request = self.factory.post("/", data=post_data, **self.extra)
+                response = self.view(request)
+
+                mock_requests.get.assert_called_with(xls_url, timeout=30)
+                xls_file.close()
+
+                self.assertEqual(response.status_code, 201)
+                self.assertEqual(XForm.objects.count(), pre_count + 1)
+
+    # pylint: disable=invalid-name
+    @patch("onadata.apps.main.forms.requests")
+    def test_publish_xlsform_using_url_with_no_extension(self, mock_requests):
+        with HTTMock(enketo_mock, xls_url_no_extension_mock):
+            xls_url = "https://ona.io/examples/forms/tutorial/form"
+            pre_count = XForm.objects.count()
+            path = os.path.join(
+                settings.PROJECT_ROOT,
+                "apps",
+                "main",
+                "tests",
+                "fixtures",
+                "transportation",
+                "transportation_different_id_string.xlsx",
+            )
+
+            with open(path, "rb") as xls_file:
+                mock_response = get_mocked_response_for_file(
+                    xls_file, "transportation_version.xlsx", 200
+                )
+                mock_requests.head.return_value = mock_response
+                mock_requests.get.return_value = mock_response
+
+                post_data = {"xls_url": xls_url}
+                request = self.factory.post("/", data=post_data, **self.extra)
+                response = self.view(request)
+
+                self.assertEqual(response.status_code, 201, response.data)
+                self.assertEqual(XForm.objects.count(), pre_count + 1)
+
+    # pylint: disable=invalid-name
+    @patch("onadata.apps.main.forms.requests")
+    def test_publish_xlsform_using_url_content_disposition_attr_jumbled_v1(
+        self, mock_requests
+    ):
+        with HTTMock(
+            enketo_mock, xls_url_no_extension_mock_content_disposition_attr_jumbled_v1
+        ):
+            xls_url = "https://ona.io/examples/forms/tutorial/form"
+            pre_count = XForm.objects.count()
+            path = os.path.join(
+                settings.PROJECT_ROOT,
+                "apps",
+                "main",
+                "tests",
+                "fixtures",
+                "transportation",
+                "transportation_different_id_string.xlsx",
+            )
+
+            with open(path, "rb") as xls_file:
+                mock_response = get_mocked_response_for_file(
+                    xls_file, "transportation_different_id_string.xlsx", 200
+                )
+                mock_requests.head.return_value = mock_response
+                mock_requests.get.return_value = mock_response
+
+                post_data = {"xls_url": xls_url}
+                request = self.factory.post("/", data=post_data, **self.extra)
+                response = self.view(request)
+
+                self.assertEqual(response.status_code, 201)
+                self.assertEqual(XForm.objects.count(), pre_count + 1)
+
+    # pylint: disable=invalid-name
+    @patch("onadata.apps.main.forms.requests")
+    def test_publish_xlsform_using_url_content_disposition_attr_jumbled_v2(
+        self, mock_requests
+    ):
+        with HTTMock(
+            enketo_mock, xls_url_no_extension_mock_content_disposition_attr_jumbled_v2
+        ):
+            xls_url = "https://ona.io/examples/forms/tutorial/form"
+            pre_count = XForm.objects.count()
+            path = os.path.join(
+                settings.PROJECT_ROOT,
+                "apps",
+                "main",
+                "tests",
+                "fixtures",
+                "transportation",
+                "transportation_different_id_string.xlsx",
+            )
+
+            with open(path, "rb") as xls_file:
+                mock_response = get_mocked_response_for_file(
+                    xls_file, "transportation_different_id_string.xlsx", 200
+                )
+                mock_requests.head.return_value = mock_response
+                mock_requests.get.return_value = mock_response
+
+                post_data = {"xls_url": xls_url}
+                request = self.factory.post("/", data=post_data, **self.extra)
+                response = self.view(request)
+
+                self.assertEqual(response.status_code, 201)
+                self.assertEqual(XForm.objects.count(), pre_count + 1)
+
+    # pylint: disable=invalid-name
+    @patch("onadata.apps.main.forms.requests")
+    def test_publish_csvform_using_url_upload(self, mock_requests):
+        with HTTMock(enketo_mock):
+            csv_url = "https://ona.io/examples/forms/tutorial/form.csv"
+            pre_count = XForm.objects.count()
+            path = os.path.join(
+                settings.PROJECT_ROOT,
+                "apps",
+                "api",
+                "tests",
+                "fixtures",
+                "text_and_integer.csv",
+            )
+
+            with open(path, "rb") as csv_file:
+                mock_response = get_mocked_response_for_file(
+                    csv_file, "text_and_integer.csv", 200
+                )
+                mock_requests.head.return_value = mock_response
+                mock_requests.get.return_value = mock_response
+
+                post_data = {"csv_url": csv_url}
+                request = self.factory.post("/", data=post_data, **self.extra)
+                response = self.view(request)
+
+                mock_requests.get.assert_called_with(csv_url, timeout=30)
+                csv_file.close()
+
+                self.assertEqual(response.status_code, 201)
+                self.assertEqual(XForm.objects.count(), pre_count + 1)
+
+    # pylint: disable=invalid-name
+    def test_publish_select_external_xlsform(self):
+        with HTTMock(enketo_urls_mock):
+            path = os.path.join(
+                settings.PROJECT_ROOT,
+                "apps",
+                "api",
+                "tests",
+                "fixtures",
+                "select_one_external.xlsx",
+            )
+            with open(path, "rb") as xls_file:
+                # pylint: disable=no-member
+                meta_count = MetaData.objects.count()
+                post_data = {"xls_file": xls_file}
+                request = self.factory.post("/", data=post_data, **self.extra)
+                response = self.view(request)
+                xform = self.user.xforms.all()[0]
+                self.assertEqual(response.status_code, 201)
+                self.assertEqual(meta_count + 4, MetaData.objects.count())
+                metadata = MetaData.objects.get(
+                    object_id=xform.id, data_value="itemsets.csv"
+                )
+                self.assertIsNotNone(metadata)
+                self.assertTrue(OwnerRole.user_has_role(self.user, xform))
+                self.assertEqual("owner", response.data["users"][0]["role"], self.user)
+
+    def test_publish_csv_with_universal_newline_xlsform(self):
+        with HTTMock(enketo_mock):
+            path = os.path.join(
+                settings.PROJECT_ROOT,
+                "apps",
+                "api",
+                "tests",
+                "fixtures",
+                "universal_newline.csv",
+            )
+            with open(path, encoding="utf-8") as xls_file:
+                post_data = {"xls_file": xls_file}
+                request = self.factory.post("/", data=post_data, **self.extra)
+                response = self.view(request)
+                self.assertEqual(response.status_code, 201, response.data)
+
+    def test_publish_xlsform_anon(self):
+        path = os.path.join(
+            settings.PROJECT_ROOT,
+            "apps",
+            "main",
+            "tests",
+            "fixtures",
+            "transportation",
+            "transportation.xlsx",
+        )
+        username = "Anon"
+        error_msg = "User with username %s does not exist." % username
+        with open(path, "rb") as xls_file:
+            post_data = {"xls_file": xls_file, "owner": username}
+            request = self.factory.post("/", data=post_data, **self.extra)
+            response = self.view(request)
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.get("Cache-Control"), None)
+            self.assertEqual(response.data.get("message"), error_msg)
+
+    def test_publish_invalid_xls_form(self):
+        path = os.path.join(
+            settings.PROJECT_ROOT,
+            "apps",
+            "main",
+            "tests",
+            "fixtures",
+            "transportation",
+            "transportation.bad_id.xlsx",
+        )
+        with open(path, "rb") as xls_file:
+            post_data = {"xls_file": xls_file}
+            request = self.factory.post("/", data=post_data, **self.extra)
+            response = self.view(request)
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.get("Cache-Control"), None)
+            error_msg = (
+                "In strict mode, the XForm ID must be "
+                "a valid slug and contain no spaces."
+                " Please ensure that you have set an"
+                " id_string in the settings sheet or "
+                "have modified the filename to not "
+                "contain any spaces."
+            )
+            self.assertEqual(response.data.get("text"), error_msg)
+
+        path = os.path.join(
+            settings.PROJECT_ROOT,
+            "apps",
+            "main",
+            "tests",
+            "fixtures",
+            "transportation",
+            "transportation_ampersand_in_title.xlsx",
+        )
+        with open(path, "rb") as xls_file:
+            post_data = {"xls_file": xls_file}
+            request = self.factory.post("/", data=post_data, **self.extra)
+            response = self.view(request)
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.get("Cache-Control"), None)
+            error_msg = (
+                "Title shouldn't have any invalid xml characters " "('>' '&' '<')"
+            )
+            self.assertEqual(response.data.get("text"), error_msg)
+
+    def test_publish_invalid_xls_form_no_choices(self):
+        path = os.path.join(
+            settings.PROJECT_ROOT,
+            "apps",
+            "main",
+            "tests",
+            "fixtures",
+            "transportation",
+            "transportation.no_choices.xlsx",
+        )
+        with open(path, "rb") as xls_file:
+            post_data = {"xls_file": xls_file}
+            request = self.factory.post("/", data=post_data, **self.extra)
+            response = self.view(request)
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.get("Cache-Control"), None)
+            error_msg = (
+                "There should be a choices sheet in this xlsform. "
+                "Please ensure that the choices sheet has the mandatory columns "
+                "'list_name', 'name', and 'label'."
+            )
+            self.assertEqual(response.data.get("text"), error_msg)
+
+    def test_upload_xml_form_file(self):
+        with HTTMock(enketo_mock):
+            path = os.path.join(
+                os.path.dirname(__file__), "..", "fixtures", "forms", "contributions"
+            )
+            form_path = os.path.join(path, "contributions.xml")
+            xforms = XForm.objects.count()
+
+            with open(form_path, encoding="utf-8") as xml_file:
+                post_data = {"xml_file": xml_file}
+                request = self.factory.post("/", data=post_data, **self.extra)
+                response = self.view(request)
+                self.assertEqual(xforms + 1, XForm.objects.count())
+                self.assertEqual(response.status_code, 201)
+
+            instances_path = os.path.join(path, "instances")
+            for uuid in os.listdir(instances_path):
+                s_path = os.path.join(instances_path, uuid, "submission.xml")
+                self._make_submission(s_path)
+            xform = XForm.objects.last()
+            self.assertEqual(xform.instances.count(), 6)
+
+    def test_form_publishing_floip(self):
+        self.skipTest("FLOIP package out of date with pyxform 3.0.0")
+        with HTTMock(enketo_mock):
+            xforms = XForm.objects.count()
+            path = os.path.join(
+                os.path.dirname(__file__),
+                "../",
+                "fixtures",
+                "flow-results-example-1.json",
+            )
+            with open(path, "rb") as xls_file:
+                post_data = {"floip_file": xls_file}
+                request = self.factory.post("/", data=post_data, **self.extra)
+                response = self.view(request)
+                self.assertEqual(response.status_code, 201, response.data)
+                self.assertEqual(xforms + 1, XForm.objects.count())
+
+    def test_external_choice_integer_name_xlsform(self):
+        """Test that names with integers are converted to strings"""
+        with HTTMock(enketo_urls_mock):
+            path = os.path.join(
+                settings.PROJECT_ROOT,
+                "apps",
+                "api",
+                "tests",
+                "fixtures",
+                "integer_name_test.xlsx",
+            )
+            with open(path, "rb") as xls_file:
+                # pylint: disable=no-member
+                meta_count = MetaData.objects.count()
+                post_data = {"xls_file": xls_file}
+                request = self.factory.post("/", data=post_data, **self.extra)
+                response = self.view(request)
+                xform = self.user.xforms.all()[0]
+                self.assertEqual(response.status_code, 201)
+                self.assertEqual(meta_count + 4, MetaData.objects.count())
+                metadata = MetaData.objects.get(
+                    object_id=xform.id, data_value="itemsets.csv"
+                )
+                self.assertIsNotNone(metadata)
+
+                csv_reader = csv.reader(codecs.iterdecode(metadata.data_file, "utf-8"))
+                expected_data = [
+                    ["list_name", "name", "label", "state", "county"],
+                    ["states", "1", "Texas", "", ""],
+                    ["states", "2", "Washington", "", ""],
+                    ["counties", "b1", "King", "2", ""],
+                    ["counties", "b2", "Pierce", "2", ""],
+                    ["counties", "b3", "King", "1", ""],
+                    ["counties", "b4", "Cameron", "1", ""],
+                    ["cities", "dumont", "Dumont", "1", "b3"],
+                    ["cities", "finney", "Finney", "1", "b3"],
+                    ["cities", "brownsville", "brownsville", "1", "b4"],
+                    ["cities", "harlingen", "harlingen", "1", "b4"],
+                    ["cities", "seattle", "Seattle", "2", "b3"],
+                    ["cities", "redmond", "Redmond", "2", "b3"],
+                    ["cities", "tacoma", "Tacoma", "2", "b2"],
+                    ["cities", "puyallup", "Puyallup", "2", "b2"],
+                ]
+                for index, row in enumerate(csv_reader):
+                    self.assertEqual(row, expected_data[index])
+
+
+class TestXFormViewSet(XFormViewSetBaseTestCase):
+    """Test XFormViewSet"""
+
+    def setUp(self):
+        super(TestXFormViewSet, self).setUp()
+        self.view = XFormViewSet.as_view(
+            {
+                "get": "list",
+            }
+        )
+
     @patch("onadata.apps.api.viewsets.xform_viewset.send_message")
+    @flaky
     def test_replace_form_with_external_choices(self, mock_send_message):
         with HTTMock(enketo_mock):
             xls_file_path = os.path.join(
@@ -190,8 +751,12 @@ class TestXFormViewSet(TestAbstractViewSet):
                 self.assertEqual(response.status_code, 200)
             # send message upon form update
             self.assertTrue(mock_send_message.called)
-            mock_send_message.called_with(
-                self.xform.id, self.xform.id, XFORM, request.user, FORM_UPDATED
+            mock_send_message.assert_called_with(
+                instance_id=self.xform.id,
+                target_id=self.xform.id,
+                target_type=XFORM,
+                user=request.user,
+                message_verb=FORM_UPDATED,
             )
 
     def test_form_publishing_using_invalid_text_xls_form(self):
@@ -871,7 +1436,7 @@ class TestXFormViewSet(TestAbstractViewSet):
             formid = self.xform.pk
             request = self.factory.get("/", **self.extra)
             # get existing form format
-            exsting_format = get_existing_file_format(self.xform.xls, 'xls')
+            exsting_format = get_existing_file_format(self.xform.xls, "xls")
 
             # XLSX format
             response = view(request, pk=formid, format="xlsx")
@@ -1226,7 +1791,13 @@ class TestXFormViewSet(TestAbstractViewSet):
                 "Authentication failure, cannot redirect",
             )
 
-    @override_settings(ENKETO_CLIENT_LOGIN_URL="http://test.ona.io/login")
+    @override_settings(
+        ENKETO_CLIENT_LOGIN_URL={
+            "*": "http://test.ona.io/login",
+            "stage-testserver": "http://gh.ij.kl/login",
+        }
+    )
+    @override_settings(ALLOWED_HOSTS=["*"])
     def test_login_enketo_no_jwt_but_with_return_url(self):
         with HTTMock(enketo_urls_mock):
             self._publish_xls_form_to_project()
@@ -1237,9 +1808,16 @@ class TestXFormViewSet(TestAbstractViewSet):
             url = "https://enketo.ona.io/::YY8M"
             query_data = {"return": url}
             request = self.factory.get("/", data=query_data)
-            response = view(request, pk=formid)
 
-            # user is redirected to the set login page in settings file
+            # user is redirected to default login page "*"
+            response = view(request, pk=formid)
+            self.assertTrue(response.url.startswith("http://test.ona.io/login"))
+            self.assertEqual(response.status_code, 302)
+
+            # user is redirected to login page for "stage-testserver"
+            request.META["HTTP_HOST"] = "stage-testserver"
+            response = view(request, pk=formid)
+            self.assertTrue(response.url.startswith("http://gh.ij.kl/login"))
             self.assertEqual(response.status_code, 302)
 
     @override_settings(JWT_SECRET_KEY=JWT_SECRET_KEY, JWT_ALGORITHM=JWT_ALGORITHM)
@@ -1326,441 +1904,6 @@ class TestXFormViewSet(TestAbstractViewSet):
             self.assertEqual(username_cookie.split(":")[0], "bob")
             self.assertEqual(uid_cookie.split(":")[0], "bob")
 
-    def test_publish_xlsform(self):
-        with HTTMock(enketo_urls_mock):
-            view = XFormViewSet.as_view({"post": "create"})
-            data = {
-                "owner": "http://testserver/api/v1/users/bob",
-                "public": False,
-                "public_data": False,
-                "description": "",
-                "downloadable": True,
-                "allows_sms": False,
-                "encrypted": False,
-                "sms_id_string": "transportation_2011_07_25",
-                "id_string": "transportation_2011_07_25",
-                "title": "transportation_2011_07_25",
-                "bamboo_dataset": "",
-            }
-            path = os.path.join(
-                settings.PROJECT_ROOT,
-                "apps",
-                "main",
-                "tests",
-                "fixtures",
-                "transportation",
-                "transportation.xlsx",
-            )
-
-            with open(path, "rb") as xls_file:
-                post_data = {"xls_file": xls_file}
-                request = self.factory.post("/", data=post_data, **self.extra)
-                response = view(request)
-                self.assertEqual(response.status_code, 201)
-                xform = self.user.xforms.get(id_string="transportation_2011_07_25")
-                data.update({"url": "http://testserver/api/v1/forms/%s" % xform.pk})
-
-                self.assertDictContainsSubset(data, response.data)
-                self.assertTrue(OwnerRole.user_has_role(self.user, xform))
-                self.assertEqual("owner", response.data["users"][0]["role"])
-
-                # pylint: disable=no-member
-                self.assertIsNotNone(
-                    MetaData.objects.get(object_id=xform.id, data_type="enketo_url")
-                )
-                self.assertIsNotNone(
-                    MetaData.objects.get(
-                        object_id=xform.id, data_type="enketo_preview_url"
-                    )
-                )
-
-                # Ensure XFormVersion object is created on XForm publish
-                versions_count = XFormVersion.objects.filter(xform=xform).count()
-                self.assertEqual(versions_count, 1)
-
-    def test_publish_xlsforms_with_same_id_string(self):
-        with HTTMock(enketo_urls_mock):
-            counter = XForm.objects.count()
-            view = XFormViewSet.as_view({"post": "create"})
-            data = {
-                "owner": "http://testserver/api/v1/users/bob",
-                "public": False,
-                "public_data": False,
-                "description": "",
-                "downloadable": True,
-                "allows_sms": False,
-                "encrypted": False,
-                "sms_id_string": "transportation_2011_07_25",
-                "id_string": "transportation_2011_07_25",
-                "title": "transportation_2011_07_25",
-                "bamboo_dataset": "",
-            }
-            path = os.path.join(
-                settings.PROJECT_ROOT,
-                "apps",
-                "main",
-                "tests",
-                "fixtures",
-                "transportation",
-                "transportation.xlsx",
-            )
-            with open(path, "rb") as xls_file:
-                post_data = {"xls_file": xls_file}
-                request = self.factory.post("/", data=post_data, **self.extra)
-                response = view(request)
-                self.assertEqual(response.status_code, 201)
-                xform = self.user.xforms.all()[0]
-                data.update(
-                    {
-                        "url": "http://testserver/api/v1/forms/%s" % xform.pk,
-                        "has_id_string_changed": False,
-                    }
-                )
-                self.assertDictContainsSubset(data, response.data)
-                self.assertTrue(OwnerRole.user_has_role(self.user, xform))
-                self.assertEqual("owner", response.data["users"][0]["role"])
-
-                # pylint: disable=no-member
-                self.assertIsNotNone(
-                    MetaData.objects.get(object_id=xform.id, data_type="enketo_url")
-                )
-                self.assertIsNotNone(
-                    MetaData.objects.get(
-                        object_id=xform.id, data_type="enketo_preview_url"
-                    )
-                )
-
-            self.assertEqual(counter + 1, XForm.objects.count())
-            path = os.path.join(
-                settings.PROJECT_ROOT,
-                "apps",
-                "main",
-                "tests",
-                "fixtures",
-                "transportation",
-                "transportation_copy.xlsx",
-            )
-
-            with open(path, "rb") as xls_file:
-                post_data = {"xls_file": xls_file}
-                request = self.factory.post("/", data=post_data, **self.extra)
-                response = view(request)
-                self.assertEqual(response.status_code, 201)
-                xform = self.user.xforms.get(id_string="Transportation_2011_07_25_1")
-                data.update(
-                    {
-                        "url": "http://testserver/api/v1/forms/%s" % xform.pk,
-                        "id_string": "Transportation_2011_07_25_1",
-                        "title": "Transportation_2011_07_25",
-                        "sms_id_string": "Transportation_2011_07_25",
-                        "has_id_string_changed": True,
-                    }
-                )
-
-                self.assertDictContainsSubset(data, response.data)
-                self.assertTrue(OwnerRole.user_has_role(self.user, xform))
-                self.assertEqual("owner", response.data["users"][0]["role"])
-
-                # pylint: disable=no-member
-                self.assertIsNotNone(
-                    MetaData.objects.get(object_id=xform.id, data_type="enketo_url")
-                )
-                self.assertIsNotNone(
-                    MetaData.objects.get(
-                        object_id=xform.id, data_type="enketo_preview_url"
-                    )
-                )
-
-            xform = XForm.objects.get(id_string="transportation_2011_07_25")
-            self.assertIsInstance(xform, XForm)
-            self.assertEqual(counter + 2, XForm.objects.count())
-
-    # pylint: disable=invalid-name
-    @patch("onadata.apps.main.forms.requests")
-    def test_publish_xlsform_using_url_upload(self, mock_requests):
-        with HTTMock(enketo_mock):
-            view = XFormViewSet.as_view({"post": "create"})
-
-            xls_url = "https://ona.io/examples/forms/tutorial/form.xlsx"
-            pre_count = XForm.objects.count()
-            path = os.path.join(
-                settings.PROJECT_ROOT,
-                "apps",
-                "main",
-                "tests",
-                "fixtures",
-                "transportation",
-                "transportation_different_id_string.xlsx",
-            )
-
-            with open(path, "rb") as xls_file:
-                mock_response = get_mocked_response_for_file(
-                    xls_file, "transportation_different_id_string.xlsx", 200
-                )
-                mock_requests.head.return_value = mock_response
-                mock_requests.get.return_value = mock_response
-
-                post_data = {"xls_url": xls_url}
-                request = self.factory.post("/", data=post_data, **self.extra)
-                response = view(request)
-
-                mock_requests.get.assert_called_with(xls_url)
-                xls_file.close()
-
-                self.assertEqual(response.status_code, 201)
-                self.assertEqual(XForm.objects.count(), pre_count + 1)
-
-    # pylint: disable=invalid-name
-    @patch("onadata.apps.main.forms.requests")
-    def test_publish_xlsform_using_url_with_no_extension(self, mock_requests):
-        with HTTMock(enketo_mock, xls_url_no_extension_mock):
-            view = XFormViewSet.as_view({"post": "create"})
-
-            xls_url = "https://ona.io/examples/forms/tutorial/form"
-            pre_count = XForm.objects.count()
-            path = os.path.join(
-                settings.PROJECT_ROOT,
-                "apps",
-                "main",
-                "tests",
-                "fixtures",
-                "transportation",
-                "transportation_different_id_string.xlsx",
-            )
-
-            with open(path, "rb") as xls_file:
-                mock_response = get_mocked_response_for_file(
-                    xls_file, "transportation_version.xlsx", 200
-                )
-                mock_requests.head.return_value = mock_response
-                mock_requests.get.return_value = mock_response
-
-                post_data = {"xls_url": xls_url}
-                request = self.factory.post("/", data=post_data, **self.extra)
-                response = view(request)
-
-                self.assertEqual(response.status_code, 201, response.data)
-                self.assertEqual(XForm.objects.count(), pre_count + 1)
-
-    # pylint: disable=invalid-name
-    @patch("onadata.apps.main.forms.requests")
-    def test_publish_xlsform_using_url_content_disposition_attr_jumbled_v1(
-        self, mock_requests
-    ):
-        with HTTMock(
-            enketo_mock, xls_url_no_extension_mock_content_disposition_attr_jumbled_v1
-        ):
-            view = XFormViewSet.as_view({"post": "create"})
-
-            xls_url = "https://ona.io/examples/forms/tutorial/form"
-            pre_count = XForm.objects.count()
-            path = os.path.join(
-                settings.PROJECT_ROOT,
-                "apps",
-                "main",
-                "tests",
-                "fixtures",
-                "transportation",
-                "transportation_different_id_string.xlsx",
-            )
-
-            with open(path, "rb") as xls_file:
-                mock_response = get_mocked_response_for_file(
-                    xls_file, "transportation_different_id_string.xlsx", 200
-                )
-                mock_requests.head.return_value = mock_response
-                mock_requests.get.return_value = mock_response
-
-                post_data = {"xls_url": xls_url}
-                request = self.factory.post("/", data=post_data, **self.extra)
-                response = view(request)
-
-                self.assertEqual(response.status_code, 201)
-                self.assertEqual(XForm.objects.count(), pre_count + 1)
-
-    # pylint: disable=invalid-name
-    @patch("onadata.apps.main.forms.requests")
-    def test_publish_xlsform_using_url_content_disposition_attr_jumbled_v2(
-        self, mock_requests
-    ):
-        with HTTMock(
-            enketo_mock, xls_url_no_extension_mock_content_disposition_attr_jumbled_v2
-        ):
-            view = XFormViewSet.as_view({"post": "create"})
-
-            xls_url = "https://ona.io/examples/forms/tutorial/form"
-            pre_count = XForm.objects.count()
-            path = os.path.join(
-                settings.PROJECT_ROOT,
-                "apps",
-                "main",
-                "tests",
-                "fixtures",
-                "transportation",
-                "transportation_different_id_string.xlsx",
-            )
-
-            with open(path, "rb") as xls_file:
-                mock_response = get_mocked_response_for_file(
-                    xls_file, "transportation_different_id_string.xlsx", 200
-                )
-                mock_requests.head.return_value = mock_response
-                mock_requests.get.return_value = mock_response
-
-                post_data = {"xls_url": xls_url}
-                request = self.factory.post("/", data=post_data, **self.extra)
-                response = view(request)
-
-                self.assertEqual(response.status_code, 201)
-                self.assertEqual(XForm.objects.count(), pre_count + 1)
-
-    # pylint: disable=invalid-name
-    @patch("onadata.apps.main.forms.requests")
-    def test_publish_csvform_using_url_upload(self, mock_requests):
-        with HTTMock(enketo_mock):
-            view = XFormViewSet.as_view({"post": "create"})
-
-            csv_url = "https://ona.io/examples/forms/tutorial/form.csv"
-            pre_count = XForm.objects.count()
-            path = os.path.join(
-                settings.PROJECT_ROOT,
-                "apps",
-                "api",
-                "tests",
-                "fixtures",
-                "text_and_integer.csv",
-            )
-
-            with open(path, "rb") as csv_file:
-                mock_response = get_mocked_response_for_file(
-                    csv_file, "text_and_integer.csv", 200
-                )
-                mock_requests.head.return_value = mock_response
-                mock_requests.get.return_value = mock_response
-
-                post_data = {"csv_url": csv_url}
-                request = self.factory.post("/", data=post_data, **self.extra)
-                response = view(request)
-
-                mock_requests.get.assert_called_with(csv_url)
-                csv_file.close()
-
-                self.assertEqual(response.status_code, 201)
-                self.assertEqual(XForm.objects.count(), pre_count + 1)
-
-    # pylint: disable=invalid-name
-    def test_publish_select_external_xlsform(self):
-        with HTTMock(enketo_urls_mock):
-            view = XFormViewSet.as_view({"post": "create"})
-            path = os.path.join(
-                settings.PROJECT_ROOT,
-                "apps",
-                "api",
-                "tests",
-                "fixtures",
-                "select_one_external.xlsx",
-            )
-            with open(path, "rb") as xls_file:
-                # pylint: disable=no-member
-                meta_count = MetaData.objects.count()
-                post_data = {"xls_file": xls_file}
-                request = self.factory.post("/", data=post_data, **self.extra)
-                response = view(request)
-                xform = self.user.xforms.all()[0]
-                self.assertEqual(response.status_code, 201)
-                self.assertEqual(meta_count + 4, MetaData.objects.count())
-                metadata = MetaData.objects.get(
-                    object_id=xform.id, data_value="itemsets.csv"
-                )
-                self.assertIsNotNone(metadata)
-                self.assertTrue(OwnerRole.user_has_role(self.user, xform))
-                self.assertEqual("owner", response.data["users"][0]["role"], self.user)
-
-    def test_publish_csv_with_universal_newline_xlsform(self):
-        with HTTMock(enketo_mock):
-            view = XFormViewSet.as_view({"post": "create"})
-            path = os.path.join(
-                settings.PROJECT_ROOT,
-                "apps",
-                "api",
-                "tests",
-                "fixtures",
-                "universal_newline.csv",
-            )
-            with open(path, encoding="utf-8") as xls_file:
-                post_data = {"xls_file": xls_file}
-                request = self.factory.post("/", data=post_data, **self.extra)
-                response = view(request)
-                self.assertEqual(response.status_code, 201, response.data)
-
-    def test_publish_xlsform_anon(self):
-        view = XFormViewSet.as_view({"post": "create"})
-        path = os.path.join(
-            settings.PROJECT_ROOT,
-            "apps",
-            "main",
-            "tests",
-            "fixtures",
-            "transportation",
-            "transportation.xlsx",
-        )
-        username = "Anon"
-        error_msg = "User with username %s does not exist." % username
-        with open(path, "rb") as xls_file:
-            post_data = {"xls_file": xls_file, "owner": username}
-            request = self.factory.post("/", data=post_data, **self.extra)
-            response = view(request)
-            self.assertEqual(response.status_code, 400)
-            self.assertEqual(response.get("Cache-Control"), None)
-            self.assertEqual(response.data.get("message"), error_msg)
-
-    def test_publish_invalid_xls_form(self):
-        view = XFormViewSet.as_view({"post": "create"})
-        path = os.path.join(
-            settings.PROJECT_ROOT,
-            "apps",
-            "main",
-            "tests",
-            "fixtures",
-            "transportation",
-            "transportation.bad_id.xlsx",
-        )
-        with open(path, "rb") as xls_file:
-            post_data = {"xls_file": xls_file}
-            request = self.factory.post("/", data=post_data, **self.extra)
-            response = view(request)
-            self.assertEqual(response.status_code, 400)
-            self.assertEqual(response.get("Cache-Control"), None)
-            error_msg = (
-                "In strict mode, the XForm ID must be "
-                "a valid slug and contain no spaces."
-                " Please ensure that you have set an"
-                " id_string in the settings sheet or "
-                "have modified the filename to not "
-                "contain any spaces."
-            )
-            self.assertEqual(response.data.get("text"), error_msg)
-
-        path = os.path.join(
-            settings.PROJECT_ROOT,
-            "apps",
-            "main",
-            "tests",
-            "fixtures",
-            "transportation",
-            "transportation_ampersand_in_title.xlsx",
-        )
-        with open(path, "rb") as xls_file:
-            post_data = {"xls_file": xls_file}
-            request = self.factory.post("/", data=post_data, **self.extra)
-            response = view(request)
-            self.assertEqual(response.status_code, 400)
-            self.assertEqual(response.get("Cache-Control"), None)
-            error_msg = (
-                "Title shouldn't have any invalid xml characters " "('>' '&' '<')"
-            )
-            self.assertEqual(response.data.get("text"), error_msg)
-
     @patch("onadata.apps.api.viewsets.xform_viewset.XFormViewSet.list")
     def test_return_400_on_xlsform_error_on_list_action(self, mock_set_title):
         with HTTMock(enketo_mock):
@@ -1772,30 +1915,6 @@ class TestXFormViewSet(TestAbstractViewSet):
                 self.assertTrue(mock_set_title.called)
                 self.assertEqual(response.status_code, 400)
                 self.assertEqual(response.content.decode("utf-8"), error_msg)
-
-    def test_publish_invalid_xls_form_no_choices(self):
-        view = XFormViewSet.as_view({"post": "create"})
-        path = os.path.join(
-            settings.PROJECT_ROOT,
-            "apps",
-            "main",
-            "tests",
-            "fixtures",
-            "transportation",
-            "transportation.no_choices.xlsx",
-        )
-        with open(path, "rb") as xls_file:
-            post_data = {"xls_file": xls_file}
-            request = self.factory.post("/", data=post_data, **self.extra)
-            response = view(request)
-            self.assertEqual(response.status_code, 400)
-            self.assertEqual(response.get("Cache-Control"), None)
-            error_msg = (
-                "There should be a choices sheet in this xlsform. "
-                "Please ensure that the choices sheet has the mandatory columns "
-                "'list_name', 'name', and 'label'."
-            )
-            self.assertEqual(response.data.get("text"), error_msg)
 
     def test_partial_update(self):
         with HTTMock(enketo_mock):
@@ -2160,6 +2279,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             self.assertEqual(response.status_code, 201)
             self.assertEqual(count + 1, XForm.objects.count())
 
+    @flaky(max_runs=8)
     def test_return_error_on_clone_duplicate(self):
         with HTTMock(enketo_mock):
             self._publish_xls_form_to_project()
@@ -2204,6 +2324,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             "instances_with_geopoints": False,
             "has_hxl_support": False,
             "hash": "",
+            "is_instance_json_regenerated": False,
         }
         self.assertEqual(data, XFormSerializer(None).data)
 
@@ -3441,6 +3562,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             self.assertEqual(response.status_code, 202)
             self.assertEqual(response.data, error_message)
 
+    @flaky(max_runs=10)
     def test_survey_preview_endpoint(self):
         view = XFormViewSet.as_view({"post": "survey_preview", "get": "survey_preview"})
 
@@ -3496,9 +3618,9 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
         response = view(request)
         self.assertEqual(response.status_code, 400, response.data)
         error_message = (
-            "[row : 2] Invalid question name [sdfasdfaf "
-            "sdf] Names must begin with a letter, colon, or underscore."
-            "Subsequent characters can include numbers, dashes, and periods."
+            "[row : 2] Invalid question name 'sdfasdfaf sdf'. "
+            "Names must begin with a letter, colon, or underscore. "
+            "Other characters can include numbers, dashes, and periods."
         )
         self.assertEqual(response.data.get("detail"), error_message)
 
@@ -3546,34 +3668,6 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
 
             self.assertEqual(response.status_code, 404)
 
-    @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
-    @patch("onadata.libs.utils.api_export_tools.AsyncResult")
-    def test_export_form_data_async(self, async_result):
-        with HTTMock(enketo_mock):
-            self._publish_xls_form_to_project()
-            view = XFormViewSet.as_view(
-                {
-                    "get": "export_async",
-                }
-            )
-            formid = self.xform.pk
-
-            for format in ["xlsx", "osm", "csv"]:
-                request = self.factory.get("/", data={"format": format}, **self.extra)
-                response = view(request, pk=formid)
-                self.assertIsNotNone(response.data)
-                self.assertEqual(response.status_code, 202)
-                self.assertTrue("job_uuid" in response.data)
-                task_id = response.data.get("job_uuid")
-                get_data = {"job_uuid": task_id}
-                request = self.factory.get("/", data=get_data, **self.extra)
-                response = view(request, pk=formid)
-
-                self.assertTrue(async_result.called)
-                self.assertEqual(response.status_code, 202)
-                export = Export.objects.get(task_id=task_id)
-                self.assertTrue(export.is_successful)
-
     def test_xform_retrieve_osm_format(self):
         with HTTMock(enketo_mock):
             self._publish_xls_form_to_project()
@@ -3588,197 +3682,6 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             request = self.factory.get("/", data={"format": "osm"}, **self.extra)
             response = view(request, pk=formid)
             self.assertEqual(response.status_code, 200)
-
-    @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
-    @patch("onadata.libs.utils.api_export_tools.AsyncResult")
-    def test_export_zip_async(self, async_result):
-        with HTTMock(enketo_mock):
-            self._publish_xls_form_to_project()
-            self._make_submissions()
-            form_view = XFormViewSet.as_view(
-                {
-                    "get": "retrieve",
-                }
-            )
-            export_async_view = XFormViewSet.as_view(
-                {
-                    "get": "export_async",
-                }
-            )
-            formid = self.xform.pk
-            fmt = "zip"
-
-            request = self.factory.get("/", data={"format": fmt}, **self.extra)
-            response = export_async_view(request, pk=formid)
-            self.assertIsNotNone(response.data)
-            self.assertEqual(response.status_code, 202)
-            self.assertTrue("job_uuid" in response.data)
-            task_id = response.data.get("job_uuid")
-            get_data = {"job_uuid": task_id}
-            request = self.factory.get("/", data=get_data, **self.extra)
-            response = export_async_view(request, pk=formid)
-
-            self.assertTrue(async_result.called)
-            self.assertEqual(response.status_code, 202)
-            export = Export.objects.get(task_id=task_id)
-            self.assertTrue(export.is_successful)
-
-            request = self.factory.get("/", **self.extra)
-            response = form_view(request, pk=formid, format=fmt)
-            self.assertTrue(response.status_code, 200)
-            headers = dict(response.items())
-            content_disposition = headers["Content-Disposition"]
-            filename = filename_from_disposition(content_disposition)
-            basename, ext = os.path.splitext(filename)
-            self.assertEqual(ext, ".zip")
-
-    @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
-    @patch("onadata.libs.utils.api_export_tools.AsyncResult")
-    def test_export_async_connection_error(self, async_result):
-        with HTTMock(enketo_mock):
-            async_result.side_effect = ConnectionError(
-                "Error opening socket: a socket error occurred"
-            )
-            self._publish_xls_form_to_project()
-            view = XFormViewSet.as_view(
-                {
-                    "get": "export_async",
-                }
-            )
-            formid = self.xform.pk
-
-            format = "xlsx"
-            request = self.factory.get("/", data={"format": format}, **self.extra)
-            response = view(request, pk=formid)
-            self.assertIsNotNone(response.data)
-            self.assertEqual(response.status_code, 202)
-            self.assertTrue("job_uuid" in response.data)
-            task_id = response.data.get("job_uuid")
-            get_data = {"job_uuid": task_id}
-            request = self.factory.get("/", data=get_data, **self.extra)
-            response = view(request, pk=formid)
-
-            self.assertTrue(async_result.called)
-            self.assertEqual(response.status_code, 503)
-            self.assertEqual(response.status_text.upper(), "SERVICE UNAVAILABLE")
-            self.assertEqual(
-                response.data["detail"],
-                "Service temporarily unavailable, try again later.",
-            )
-            export = Export.objects.get(task_id=task_id)
-            self.assertTrue(export.is_successful)
-
-    @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
-    @patch("onadata.libs.utils.api_export_tools.AsyncResult")
-    def test_create_xls_report_async(self, async_result):
-        with HTTMock(enketo_mock):
-            self._publish_xls_form_to_project()
-            self._make_submissions()
-
-            data_value = "template 1|http://xls_server"
-            self._add_form_metadata(self.xform, "external_export", data_value)
-            # pylint: disable=no-member
-            metadata = MetaData.objects.get(
-                object_id=self.xform.id, data_type="external_export"
-            )
-            paths = [
-                os.path.join(
-                    self.main_directory,
-                    "fixtures",
-                    "transportation",
-                    "instances_w_uuid",
-                    s,
-                    s + ".xml",
-                )
-                for s in ["transport_2011-07-25_19-05-36"]
-            ]
-
-            self._make_submission(paths[0])
-            view = XFormViewSet.as_view(
-                {
-                    "get": "export_async",
-                }
-            )
-            formid = self.xform.pk
-            with HTTMock(external_mock):
-                # External export
-                request = self.factory.get(
-                    "/", data={"format": "xlsx", "meta": metadata.pk}, **self.extra
-                )
-                response = view(request, pk=formid)
-
-            self.assertIsNotNone(response.data)
-            self.assertEqual(response.status_code, 202)
-            self.assertTrue("job_uuid" in response.data)
-
-            data = response.data
-            get_data = {"job_uuid": data.get("job_uuid")}
-
-            request = self.factory.get("/", data=get_data, **self.extra)
-            response = view(request, pk=formid, format="xlsx")
-            self.assertTrue(async_result.called)
-            self.assertEqual(response.status_code, 202)
-
-    @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
-    @patch("onadata.libs.utils.api_export_tools.AsyncResult")
-    def test_create_xls_report_async_with_data_id(self, async_result):
-        with HTTMock(enketo_mock):
-            self._publish_xls_form_to_project()
-            self._make_submissions()
-
-            data_value = "template 1|http://xls_server"
-            self._add_form_metadata(self.xform, "external_export", data_value)
-            # pylint: disable=no-member
-            metadata = MetaData.objects.get(
-                object_id=self.xform.id, data_type="external_export"
-            )
-            paths = [
-                os.path.join(
-                    self.main_directory,
-                    "fixtures",
-                    "transportation",
-                    "instances_w_uuid",
-                    s,
-                    s + ".xml",
-                )
-                for s in ["transport_2011-07-25_19-05-36"]
-            ]
-
-            self._make_submission(paths[0])
-            self.assertEqual(self.response.status_code, 201)
-
-            view = XFormViewSet.as_view(
-                {
-                    "get": "export_async",
-                }
-            )
-            data = {"meta": metadata.pk, "data_id": self.xform.instances.all()[0].pk}
-            formid = self.xform.pk
-            request = self.factory.get("/", data=data, **self.extra)
-            with HTTMock(external_mock):
-                # External export
-                request = self.factory.get(
-                    "/",
-                    data={
-                        "format": "xlsx",
-                        "meta": metadata.pk,
-                        "data_id": self.xform.instances.all()[0].pk,
-                    },
-                    **self.extra,
-                )
-                response = view(request, pk=formid)
-
-            self.assertIsNotNone(response.data)
-            self.assertEqual(response.status_code, 202)
-            self.assertTrue("job_uuid" in response.data)
-
-            data = response.data
-            get_data = {"job_uuid": data.get("job_uuid")}
-
-            request = self.factory.get("/", data=get_data, **self.extra)
-            response = view(request, pk=formid, format="xlsx")
-            self.assertTrue(async_result.called)
-            self.assertEqual(response.status_code, 202)
 
     def test_check_async_publish_empty_uuid(self):
         view = XFormViewSet.as_view({"get": "create_async"})
@@ -4020,18 +3923,24 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             self._publish_xls_form_to_project(xlsform_path=xlsform_path)
             # submit one hxl instance
             _submission_time = parse_datetime("2013-02-18 15:54:01Z")
-            self._make_submission(
-                os.path.join(
-                    settings.PROJECT_ROOT,
-                    "apps",
-                    "main",
-                    "tests",
-                    "fixtures",
-                    "hxl_test",
-                    "hxl_example_2.xml",
-                ),
-                forced_submission_time=_submission_time,
-            )
+            mock_date_modified = datetime(2023, 9, 20, 11, 41, 0, tzinfo=timezone.utc)
+
+            with patch(
+                "django.utils.timezone.now", Mock(return_value=mock_date_modified)
+            ):
+                self._make_submission(
+                    os.path.join(
+                        settings.PROJECT_ROOT,
+                        "apps",
+                        "main",
+                        "tests",
+                        "fixtures",
+                        "hxl_test",
+                        "hxl_example_2.xml",
+                    ),
+                    forced_submission_time=_submission_time,
+                )
+
             self.assertTrue(self.xform.has_hxl_support)
 
             view = XFormViewSet.as_view({"get": "retrieve"})
@@ -4041,7 +3950,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             # check that response has property 'has_hxl_support' which is true
             self.assertEqual(response.status_code, 200)
             self.assertTrue(response.data.get("has_hxl_support"))
-
+            # sort csv data in ascending order
             data = {"win_excel_utf8": True}
             request = self.factory.get("/", data=data, **self.extra)
             response = view(request, pk=self.xform.pk, format="csv")
@@ -4049,7 +3958,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             instance = self.xform.instances.first()
             data_id, date_modified = (
                 instance.pk,
-                instance.date_modified.strftime(MONGO_STRFTIME),
+                mock_date_modified.isoformat(),
             )
 
             content = get_response_content(response)
@@ -4060,7 +3969,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
                 "_total_media,_media_count,_media_all_received\n\ufeff#age"
                 ",,,,,,,,,,,,,,\n\ufeff"
                 "38,CR7,uuid:74ee8b73-48aa-4ced-9089-862f93d49c16,"
-                "%s,74ee8b73-48aa-4ced-9089-862f93d49c16,2013-02-18T15:54:01,"
+                "%s,74ee8b73-48aa-4ced-9089-862f93d49c16,2013-02-18T15:54:01+00:00,"
                 "%s,,,201604121155,,bob,0,0,True\n" % (data_id, date_modified)
             )
             self.assertEqual(content, expected_content)
@@ -4068,9 +3977,9 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             self.assertEqual(headers["Content-Type"], "application/csv")
             content_disposition = headers["Content-Disposition"]
             filename = filename_from_disposition(content_disposition)
-            basename, ext = os.path.splitext(filename)
-            self.assertEqual(ext, ".csv")
-
+            _, ext = os.path.splitext(filename)
+            self.assertEqual(ext, '.csv"')
+            # sort csv data in ascending order
             data = {"win_excel_utf8": False}
             request = self.factory.get("/", data=data, **self.extra)
             response = view(request, pk=self.xform.pk, format="csv")
@@ -4083,7 +3992,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
                 "tted_by,_total_media,_media_count,_media_all_received\n"
                 "#age,,,,,,,,,,,,,,\n"
                 "38,CR7,uuid:74ee8b73-48aa-4ced-9089-862f93d49c16"
-                ",%s,74ee8b73-48aa-4ced-9089-862f93d49c16,2013-02-18T15:54:01,"
+                ",%s,74ee8b73-48aa-4ced-9089-862f93d49c16,2013-02-18T15:54:01+00:00,"
                 "%s,,,201604121155,,bob,0,0,True\n" % (data_id, date_modified)
             )
 
@@ -4094,7 +4003,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             content_disposition = headers["Content-Disposition"]
             filename = filename_from_disposition(content_disposition)
             basename, ext = os.path.splitext(filename)
-            self.assertEqual(ext, ".csv")
+            self.assertEqual(ext, '.csv"')
 
     @flaky
     def test_csv_export_with_and_without_include_hxl(self):
@@ -4150,7 +4059,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
                 "_date_modified,_tags,_notes,_version,_duration,_submitted_by,"
                 "_total_media,_media_count,_media_all_received\n"
                 "29,Lionel Messi,uuid:74ee8b73-48aa-4ced-9072-862f93d49c16,"
-                f"{data_id},74ee8b73-48aa-4ced-9072-862f93d49c16,2013-02-18T15:54:01,"
+                f"{data_id},74ee8b73-48aa-4ced-9072-862f93d49c16,2013-02-18T15:54:01+00:00,"
                 f"{date_modified},,,201604121155,,bob,0,0,True\n"
             )
             self.assertEqual(expected_content, content)
@@ -4159,7 +4068,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             content_disposition = headers["Content-Disposition"]
             filename = filename_from_disposition(content_disposition)
             basename, ext = os.path.splitext(filename)
-            self.assertEqual(ext, ".csv")
+            self.assertEqual(ext, '.csv"')
 
             request = self.factory.get("/", **self.extra)
             response = view(request, pk=self.xform.pk, format="csv")
@@ -4173,7 +4082,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
                 "_media_all_received\n"
                 "#age,,,,,,,,,,,,,,\n"
                 "29,Lionel Messi,uuid:74ee8b73-48aa-4ced-9072-862f93d49c16,"
-                "%s,74ee8b73-48aa-4ced-9072-862f93d49c16,2013-02-18T15:54:01"
+                "%s,74ee8b73-48aa-4ced-9072-862f93d49c16,2013-02-18T15:54:01+00:00"
                 ",%s,,,201604121155,,bob,0,0,True\n" % (data_id, date_modified)
             )
             self.assertEqual(expected_content, content)
@@ -4182,7 +4091,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             content_disposition = headers["Content-Disposition"]
             filename = filename_from_disposition(content_disposition)
             basename, ext = os.path.splitext(filename)
-            self.assertEqual(ext, ".csv")
+            self.assertEqual(ext, '.csv"')
 
     def test_csv_export__with_and_without_group_delimiter(self):
         with HTTMock(enketo_mock):
@@ -4216,7 +4125,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             content_disposition = headers["Content-Disposition"]
             filename = filename_from_disposition(content_disposition)
             basename, ext = os.path.splitext(filename)
-            self.assertEqual(ext, ".csv")
+            self.assertEqual(ext, '.csv"')
 
             content = get_response_content(response)
             content_header_row_with_slashes = content.split("\n")[0]
@@ -4231,7 +4140,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             content_disposition = headers["Content-Disposition"]
             filename = filename_from_disposition(content_disposition)
             basename, ext = os.path.splitext(filename)
-            self.assertEqual(ext, ".csv")
+            self.assertEqual(ext, '.csv"')
 
             content = get_response_content(response)
             content_header_row_with_dots = content.split("\n")[0]
@@ -4278,7 +4187,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             content_disposition = headers["Content-Disposition"]
             filename = filename_from_disposition(content_disposition)
             basename, ext = os.path.splitext(filename)
-            self.assertEqual(ext, ".csv")
+            self.assertEqual(ext, '.csv"')
 
             content = get_response_content(response)
             content_header_row_select_multiple_split = content.split("\n")[0]
@@ -4296,7 +4205,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             content_disposition = headers["Content-Disposition"]
             filename = filename_from_disposition(content_disposition)
             basename, ext = os.path.splitext(filename)
-            self.assertEqual(ext, ".csv")
+            self.assertEqual(ext, '.csv"')
 
             content = get_response_content(response)
             content_header_row_select_multiple_not_split = content.split("\n")[0]
@@ -4307,6 +4216,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             self.assertNotEqual(multiples_select_split, no_multiples_select_split)
             self.assertGreater(multiples_select_split, no_multiples_select_split)
 
+    @override_settings(ALLOWED_HOSTS=["*"])
     def test_csv_export_with_and_without_removed_group_name(self):
         with HTTMock(enketo_mock):
             self._publish_xls_form_to_project()
@@ -4331,6 +4241,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
 
             data = {"remove_group_name": True}
             request = self.factory.get("/", data=data, **self.extra)
+            request.META["HTTP_HOST"] = "example.com"
             response = view(request, pk=self.xform.pk, format="csv")
             self.assertEqual(response.status_code, 200)
 
@@ -4340,7 +4251,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             filename = filename_from_disposition(content_disposition)
             self.assertIn(GROUPNAME_REMOVED_FLAG, filename)
             basename, ext = os.path.splitext(filename)
-            self.assertEqual(ext, ".csv")
+            self.assertEqual(ext, '.csv"')
 
             expected_data = ["n/a"]
             key = "available_transportation_types_to_referral_facility_other"  # noqa
@@ -4356,7 +4267,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             filename = filename_from_disposition(content_disposition)
             self.assertNotIn(GROUPNAME_REMOVED_FLAG, filename)
             basename, ext = os.path.splitext(filename)
-            self.assertEqual(ext, ".csv")
+            self.assertEqual(ext, '.csv"')
 
             expected_data = ["n/a"]
             key = "transport/available_transportation_types_to_referral_facility_other"  # noqa
@@ -4397,7 +4308,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             filename = filename_from_disposition(content_disposition)
             self.assertNotIn(GROUPNAME_REMOVED_FLAG, filename)
             basename, ext = os.path.splitext(filename)
-            self.assertEqual(ext, ".csv")
+            self.assertEqual(ext, '.csv"')
 
             request = self.factory.get("/", **self.extra)
             response = view(request, pk=self.xform.pk, format="csv")
@@ -4412,49 +4323,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             filename = filename_from_disposition(content_disposition)
             self.assertNotIn(GROUPNAME_REMOVED_FLAG, filename)
             basename, ext = os.path.splitext(filename)
-            self.assertEqual(ext, ".csv")
-
-    @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
-    @patch("onadata.libs.utils.api_export_tools.AsyncResult")
-    def test_export_csv_data_async_with_remove_group_name(self, async_result):
-        with HTTMock(enketo_mock):
-            self._publish_xls_form_to_project()
-
-            view = XFormViewSet.as_view(
-                {
-                    "get": "export_async",
-                }
-            )
-            formid = self.xform.pk
-
-            request = self.factory.get(
-                "/", data={"format": "csv", "remove_group_name": True}, **self.extra
-            )
-            response = view(request, pk=formid)
-            self.assertIsNotNone(response.data)
-            self.assertEqual(response.status_code, 202)
-            self.assertTrue("job_uuid" in response.data)
-            task_id = response.data.get("job_uuid")
-
-            export_pk = Export.objects.all().order_by("pk").reverse()[0].pk
-
-            # metaclaass for mocking results
-            job = type(
-                str("AsyncResultMock"), (), {"state": "SUCCESS", "result": export_pk}
-            )
-            async_result.return_value = job
-
-            get_data = {"job_uuid": task_id, "remove_group_name": True}
-            request = self.factory.get("/", data=get_data, **self.extra)
-            response = view(request, pk=formid)
-
-            export = Export.objects.last()
-            self.assertIn(str(export.pk), response.data.get("export_url"))
-
-            self.assertTrue(async_result.called)
-            self.assertEqual(response.status_code, 202)
-            export = Export.objects.get(task_id=task_id)
-            self.assertTrue(export.is_successful)
+            self.assertEqual(ext, '.csv"')
 
     def test_xform_linked_dataviews(self):
         xlsform_path = os.path.join(
@@ -4566,6 +4435,41 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
         self.assertIsNotNone(self.data_view.deleted_at)
         self.assertIn("-deleted-at-", self.data_view.name)
 
+    def test_delete_xform_endpoint(self):
+        """
+        Tests that the delete_xform view soft deletes xforms
+        """
+        # publish form and make submissions
+        xlsform_path = os.path.join(
+            settings.PROJECT_ROOT, "libs", "tests", "utils", "fixtures", "tutorial.xlsx"
+        )
+        self._publish_xls_form_to_project(xlsform_path=xlsform_path)
+        for x in range(1, 9):
+            path = os.path.join(
+                settings.PROJECT_ROOT,
+                "libs",
+                "tests",
+                "utils",
+                "fixtures",
+                "tutorial",
+                "instances",
+                "uuid{}".format(x),
+                "submission.xml",
+            )
+            self._make_submission(path)
+
+        # Make request to delete
+        request = self.factory.post("/", **self.extra)
+        request.user = self.xform.user
+        response = delete_xform(
+            request, username=self.xform.user.username, id_string=self.xform.id_string
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.content, b"")
+        self.xform.refresh_from_db()
+        self.assertIsNotNone(self.xform.deleted_at)
+
     def test_multitple_enketo_urls(self):
         with HTTMock(enketo_mock):
             self._publish_xls_form_to_project()
@@ -4602,29 +4506,6 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             self.assertEqual(response.status_code, 200)
             self.assertIn("enketo_url", response.data)
 
-    def _make_submission_over_date_range(self, start, days=1):
-        self._publish_xls_form_to_project()
-
-        start_time = start
-        curr_time = start_time
-        for survey in self.surveys:
-            _submission_time = curr_time
-            self._make_submission(
-                os.path.join(
-                    settings.PROJECT_ROOT,
-                    "apps",
-                    "main",
-                    "tests",
-                    "fixtures",
-                    "transportation",
-                    "instances",
-                    survey,
-                    survey + ".xml",
-                ),
-                forced_submission_time=_submission_time,
-            )
-            curr_time += timedelta(days=days)
-
     def _validate_csv_export(
         self, response, test_file_path, field=None, test_data=None
     ):
@@ -4633,7 +4514,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
         content_disposition = headers["Content-Disposition"]
         filename = filename_from_disposition(content_disposition)
         basename, ext = os.path.splitext(filename)
-        self.assertEqual(ext, ".csv")
+        self.assertEqual(ext, '.csv"')
 
         content = get_response_content(response)
 
@@ -4655,7 +4536,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
 
     def test_csv_export_filtered_by_date(self):
         with HTTMock(enketo_mock):
-            start_date = datetime(2015, 12, 2, tzinfo=utc)
+            start_date = datetime(2015, 12, 2, tzinfo=timezone.utc)
             self._make_submission_over_date_range(start_date)
 
             first_datetime = start_date.strftime(MONGO_STRFTIME)
@@ -4682,7 +4563,10 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
                 "transportation_filtered_date.csv",
             )
 
-            expected_submission = ["2015-12-02T00:00:00", "2015-12-03T00:00:00"]
+            expected_submission = [
+                "2015-12-02T00:00:00+00:00",
+                "2015-12-03T00:00:00+00:00",
+            ]
             self._validate_csv_export(
                 response, test_file_path, "_submission_time", expected_submission
             )
@@ -4691,59 +4575,9 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             self.assertIn("query", export.options)
             self.assertEqual(export.options["query"], query_str)
 
-    @patch("onadata.libs.utils.api_export_tools.AsyncResult")
-    def test_export_form_data_async_with_filtered_date(self, async_result):
-        with HTTMock(enketo_mock):
-            start_date = datetime(2015, 12, 2, tzinfo=utc)
-            self._make_submission_over_date_range(start_date)
-
-            first_datetime = start_date.strftime(MONGO_STRFTIME)
-            second_datetime = start_date + timedelta(days=1, hours=20)
-            query_str = (
-                '{"_submission_time": {"$gte": "'
-                + first_datetime
-                + '", "$lte": "'
-                + second_datetime.strftime(MONGO_STRFTIME)
-                + '"}}'
-            )
-            count = Export.objects.all().count()
-
-            export_view = XFormViewSet.as_view(
-                {
-                    "get": "export_async",
-                }
-            )
-            formid = self.xform.pk
-
-            for export_format in ["csv"]:
-                request = self.factory.get(
-                    "/",
-                    data={"format": export_format, "query": query_str},
-                    **self.extra,
-                )
-                response = export_view(request, pk=formid)
-                self.assertIsNotNone(response.data)
-                self.assertEqual(response.status_code, 202)
-                self.assertTrue("job_uuid" in response.data)
-                self.assertEqual(count + 1, Export.objects.all().count())
-
-                task_id = response.data.get("job_uuid")
-                get_data = {"job_uuid": task_id}
-                request = self.factory.get("/", data=get_data, **self.extra)
-                response = export_view(request, pk=formid)
-
-                self.assertTrue(async_result.called)
-                self.assertEqual(response.status_code, 202)
-                export = Export.objects.get(task_id=task_id)
-                self.assertTrue(export.is_successful)
-
-                export = Export.objects.last()
-                self.assertIn("query", export.options)
-                self.assertEqual(export.options["query"], query_str)
-
     def test_previous_export_with_date_filter_is_returned(self):
         with HTTMock(enketo_mock):
-            start_date = datetime(2015, 12, 2, tzinfo=utc)
+            start_date = datetime(2015, 12, 2, tzinfo=timezone.utc)
             self._make_submission_over_date_range(start_date)
 
             first_datetime = start_date.strftime(MONGO_STRFTIME)
@@ -4823,7 +4657,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
 
     def test_normal_export_after_export_with_date_filter(self):
         with HTTMock(enketo_mock):
-            start_date = datetime(2015, 12, 2, tzinfo=utc)
+            start_date = datetime(2015, 12, 2, tzinfo=timezone.utc)
             self._make_submission_over_date_range(start_date)
 
             first_datetime = start_date.strftime(MONGO_STRFTIME)
@@ -4851,6 +4685,1121 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
 
             # should create a new export
             self.assertEqual(count + 1, Export.objects.all().count())
+
+    @override_settings(ALLOWED_HOSTS=["*"])
+    def test_csv_exports_w_images_link(self):
+        with HTTMock(enketo_mock):
+            xlsform_path = os.path.join(
+                settings.PROJECT_ROOT,
+                "libs",
+                "tests",
+                "utils",
+                "fixtures",
+                "tutorial.xlsx",
+            )
+
+            self._publish_xls_form_to_project(xlsform_path=xlsform_path)
+            media_file = "1442323232322.jpg"
+
+            path = os.path.join(
+                settings.PROJECT_ROOT,
+                "libs",
+                "tests",
+                "utils",
+                "fixtures",
+                "tutorial",
+                "instances",
+                "uuid1",
+                media_file,
+            )
+            with open(path, "rb") as f:
+                self._make_submission(
+                    os.path.join(
+                        settings.PROJECT_ROOT,
+                        "libs",
+                        "tests",
+                        "utils",
+                        "fixtures",
+                        "tutorial",
+                        "instances",
+                        "uuid1",
+                        "submission.xml",
+                    ),
+                    media_file=f,
+                    forced_submission_time=datetime(2015, 12, 2, tzinfo=timezone.utc),
+                )
+
+            attachment_id = Attachment.objects.all().last().pk
+
+            view = XFormViewSet.as_view({"get": "retrieve"})
+
+            data = {"include_images": True}
+            # request for export again
+            request = self.factory.get("/", data=data, **self.extra)
+            request.META["HTTP_HOST"] = "example.com"
+            response = view(request, pk=self.xform.pk, format="csv")
+            self.assertEqual(response.status_code, 200)
+
+            expected_data = [
+                "http://example.com/api/v1/files/{}?"
+                "filename=bob/attachments/{}_{}/"
+                "1442323232322.jpg".format(
+                    attachment_id, self.xform.id, self.xform.id_string
+                )
+            ]
+            key = "photo"
+            self._validate_csv_export(response, None, key, expected_data)
+
+            data = {"include_images": False}
+            # request for export again
+            request = self.factory.get("/", data=data, **self.extra)
+            response = view(request, pk=self.xform.pk, format="csv")
+            self.assertEqual(response.status_code, 200)
+
+            expected_data = [media_file]
+            self._validate_csv_export(response, None, key, expected_data)
+
+    def test_csv_export_with_and_without_labels_only(self):
+        with HTTMock(enketo_mock):
+            # create a project and form and add a submission to the form
+            self._publish_xls_form_to_project()
+            survey = self.surveys[0]
+            _submission_time = parse_datetime("2013-02-18 15:54:01Z")
+            self._make_submission(
+                os.path.join(
+                    settings.PROJECT_ROOT,
+                    "apps",
+                    "main",
+                    "tests",
+                    "fixtures",
+                    "transportation",
+                    "instances",
+                    survey,
+                    survey + ".xml",
+                ),
+                forced_submission_time=_submission_time,
+            )
+
+            view = XFormViewSet.as_view({"get": "retrieve"})
+
+            # export the sumbitted data as csv
+            request = self.factory.get("/", **self.extra)
+            response = view(request, pk=self.xform.pk, format="csv")
+            self.assertEqual(response.status_code, 200)
+
+            expected_data = ["n/a"]
+            key = "transport/available_transportation_types_to_referral_facility_other"  # noqa
+            self._validate_csv_export(response, None, key, expected_data)
+
+            # export submitted data with include_labels_only and
+            # remove_group_name set to true
+            data = {"include_labels_only": True, "remove_group_name": True}
+            request = self.factory.get("/", data=data, **self.extra)
+            response = view(request, pk=self.xform.pk, format="csv")
+            self.assertEqual(response.status_code, 200)
+            expected_data = ["n/a"]
+            key = "Is ambulance available daily or weekly?"
+            self._validate_csv_export(response, None, key, expected_data)
+
+            # assert that the next request without the options doesn't result
+            # to the same result as the previous result
+            request = self.factory.get("/", **self.extra)
+            response = view(request, pk=self.xform.pk, format="csv")
+            self.assertEqual(response.status_code, 200)
+
+            with self.assertRaises(KeyError):
+                self._validate_csv_export(response, None, key, expected_data)
+
+    @override_settings(GOOGLE_EXPORT=True)
+    def test_xform_gsheet_exports_disabled_sync_mode(self):
+        xlsform_path = os.path.join(
+            settings.PROJECT_ROOT, "libs", "tests", "utils", "fixtures", "tutorial.xlsx"
+        )
+
+        self._publish_xls_form_to_project(xlsform_path=xlsform_path)
+        for x in range(1, 9):
+            path = os.path.join(
+                settings.PROJECT_ROOT,
+                "libs",
+                "tests",
+                "utils",
+                "fixtures",
+                "tutorial",
+                "instances",
+                "uuid{}".format(x),
+                "submission.xml",
+            )
+            self._make_submission(path)
+            x += 1
+
+        view = XFormViewSet.as_view(
+            {
+                "get": "retrieve",
+            }
+        )
+
+        request = self.factory.get("/", **self.extra)
+        response = view(request, pk=self.xform.pk, format="gsheets")
+
+        text_response = '{"details": "Sheets export only supported in async mode"}'
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.data, text_response)
+
+    @flaky
+    def test_sav_zip_export_long_variable_length(self):
+        self._publish_xls_form_to_project()
+        survey = self.surveys[0]
+        _submission_time = parse_datetime("2013-02-18 15:54:01Z")
+        self._make_submission(
+            os.path.join(
+                settings.PROJECT_ROOT,
+                "apps",
+                "main",
+                "tests",
+                "fixtures",
+                "transportation",
+                "instances",
+                survey,
+                survey + ".xml",
+            ),
+            forced_submission_time=_submission_time,
+        )
+
+        view = XFormViewSet.as_view({"get": "retrieve"})
+
+        request = self.factory.get("/", **self.extra)
+        response = view(request, pk=self.xform.pk, format="savzip")
+        self.assertEqual(response.status_code, 200)
+
+    def test_xform_version_count(self):
+        self._publish_xls_form_to_project()
+
+        self._make_submissions()
+
+        view = XFormViewSet.as_view(
+            {
+                "get": "retrieve",
+            }
+        )
+
+        request = self.factory.get("/", **self.extra)
+        response = view(request, pk=self.xform.pk)
+
+        self.assertIn("form_versions", response.data)
+        self.assertEqual(response.data["form_versions"][0].get("total"), 4)
+
+        # soft delete an instance
+        instance = self.xform.instances.last()
+        instance.set_deleted()
+
+        # delete cache
+        safe_delete(f"{XFORM_DATA_VERSIONS}{self.xform.pk}")
+
+        request = self.factory.get("/", **self.extra)
+        response = view(request, pk=self.xform.pk)
+
+        self.assertIn("form_versions", response.data)
+        self.assertEqual(response.data["form_versions"][0].get("total"), 3)
+
+    def test_share_auto_xform_meta_perms(self):
+        with HTTMock(enketo_mock):
+            self._publish_xls_form_to_project()
+            alice_data = {"username": "alice", "email": "alice@localhost.com"}
+            alice_profile = self._create_user_profile(alice_data)
+
+            view = XFormViewSet.as_view({"post": "share"})
+            formid = self.xform.pk
+
+            data_value = "editor-minor|dataentry"
+
+            MetaData.xform_meta_permission(self.xform, data_value=data_value)
+
+            for role_class in ROLES_ORDERED:
+                data = {"username": "alice", "role": role_class.name}
+                request = self.factory.post("/", data=data, **self.extra)
+                response = view(request, pk=formid)
+
+                self.assertEqual(response.status_code, 204)
+
+                if role_class in [EditorRole, EditorMinorRole]:
+                    self.assertFalse(
+                        EditorRole.user_has_role(alice_profile.user, self.xform)
+                    )
+                    self.assertTrue(
+                        EditorMinorRole.user_has_role(alice_profile.user, self.xform)
+                    )
+
+                elif role_class in [
+                    DataEntryRole,
+                    DataEntryMinorRole,
+                    DataEntryOnlyRole,
+                ]:
+                    self.assertTrue(
+                        DataEntryRole.user_has_role(alice_profile.user, self.xform)
+                    )
+
+                else:
+                    self.assertTrue(
+                        role_class.user_has_role(alice_profile.user, self.xform)
+                    )
+
+    def test_csv_export_with_meta_perms(self):
+        with HTTMock(enketo_mock):
+            self._publish_xls_form_to_project()
+
+            for survey in self.surveys:
+                _submission_time = parse_datetime("2013-02-18 15:54:01Z")
+                self._make_submission(
+                    os.path.join(
+                        settings.PROJECT_ROOT,
+                        "apps",
+                        "main",
+                        "tests",
+                        "fixtures",
+                        "transportation",
+                        "instances",
+                        survey,
+                        survey + ".xml",
+                    ),
+                    forced_submission_time=_submission_time,
+                )
+
+            alice_data = {"username": "alice", "email": "alice@localhost.com"}
+            alice_profile = self._create_user_profile(alice_data)
+
+            data_value = "editor|dataentry-minor"
+            MetaData.xform_meta_permission(self.xform, data_value=data_value)
+
+            DataEntryMinorRole.add(alice_profile.user, self.xform)
+
+            for i in self.xform.instances.all()[:2]:
+                i.user = alice_profile.user
+                i.save()
+
+            view = XFormViewSet.as_view({"get": "retrieve"})
+
+            alices_extra = {
+                "HTTP_AUTHORIZATION": "Token %s" % alice_profile.user.auth_token.key
+            }
+
+            request = self.factory.get("/", **alices_extra)
+            response = view(request, pk=self.xform.pk, format="csv")
+            self.assertEqual(response.status_code, 200)
+
+            headers = dict(response.items())
+            self.assertEqual(headers["Content-Type"], "application/csv")
+            content_disposition = headers["Content-Disposition"]
+            filename = filename_from_disposition(content_disposition)
+            basename, ext = os.path.splitext(filename)
+            self.assertEqual(ext, '.csv"')
+
+            expected_data = ["alice", "alice"]
+            key = "_submitted_by"
+            self._validate_csv_export(response, None, key, expected_data)
+
+            DataEntryOnlyRole.add(alice_profile.user, self.xform)
+
+            request = self.factory.get("/", **alices_extra)
+            response = view(request, pk=self.xform.pk, format="csv")
+            self.assertEqual(response.status_code, 404)
+
+    def test_csv_export_cache(self):
+        with HTTMock(enketo_mock):
+            self._publish_xls_form_to_project()
+            self._make_submissions()
+
+            count = Export.objects.all().count()
+
+            view = XFormViewSet.as_view({"get": "retrieve"})
+
+            data = {"export_type": "csv", "win_excel_utf8": False}
+
+            request = self.factory.get("/", data=data, **self.extra)
+            response = view(request, pk=self.xform.pk, format="csv")
+            self.assertEqual(response.status_code, 200)
+
+            # should generate new
+            self.assertEqual(count + 1, Export.objects.all().count())
+
+            survey = self.surveys[0]
+            self._make_submission(
+                os.path.join(
+                    settings.PROJECT_ROOT,
+                    "apps",
+                    "main",
+                    "tests",
+                    "fixtures",
+                    "transportation",
+                    "instances",
+                    survey,
+                    survey + ".xml",
+                )
+            )
+
+            data = {"export_type": "csv", "win_excel_utf8": True}
+
+            request = self.factory.get("/", data=data, **self.extra)
+            response = view(request, pk=self.xform.pk, format="csv")
+            self.assertEqual(response.status_code, 200)
+
+            # changed options, should generate new
+            self.assertEqual(count + 2, Export.objects.all().count())
+
+            data = {"export_type": "csv", "win_excel_utf8": False}
+
+            request = self.factory.get("/", data=data, **self.extra)
+            response = view(request, pk=self.xform.pk, format="csv")
+            self.assertEqual(response.status_code, 200)
+
+            # reused options, should generate new with new submission
+            self.assertEqual(count + 3, Export.objects.all().count())
+
+    def test_created_by_field_on_cloned_forms(self):
+        """
+        Test that the created by field is not empty for cloned forms
+        """
+        with HTTMock(enketo_mock):
+            self._publish_xls_form_to_project()
+            view = XFormViewSet.as_view({"post": "clone"})
+            alice_data = {"username": "alice", "email": "alice@localhost.com"}
+            alice_profile = self._create_user_profile(alice_data)
+            count = XForm.objects.count()
+
+            data = {"username": "alice"}
+            formid = self.xform.pk
+            ManagerRole.add(self.user, alice_profile)
+            request = self.factory.post("/", data=data, **self.extra)
+            response = view(request, pk=formid)
+            self.assertTrue(self.user.has_perm("can_add_xform", alice_profile))
+            self.assertEqual(response.status_code, 201)
+            self.assertEqual(count + 1, XForm.objects.count())
+            cloned_form = XForm.objects.last()
+            self.assertEqual(cloned_form.created_by.username, "alice")
+
+    def test_xlsx_import(self):
+        """Ensure XLSX imports work as expected and dates are formatted correctly"""
+        with HTTMock(enketo_mock):
+            xls_path = os.path.join(
+                settings.PROJECT_ROOT,
+                "apps",
+                "main",
+                "tests",
+                "fixtures",
+                "double_image_form.xlsx",
+            )
+            self._publish_xls_form_to_project(xlsform_path=xls_path)
+            view = XFormViewSet.as_view({"post": "data_import"})
+            xls_import = fixtures_path("double_image_field_form_data.xlsx")
+            post_data = {"xls_file": xls_import}
+            request = self.factory.post("/", data=post_data, **self.extra)
+            response = view(request, pk=self.xform.id)
+
+            # check that date columns are formatted correctly
+            self.assertEqual(
+                self.xform.instances.values("json___submission_time")[::1],
+                [
+                    {"json___submission_time": "2023-02-03T10:27:41+00:00"},
+                    {"json___submission_time": "2023-02-03T10:27:42+00:00"},
+                    {"json___submission_time": "2023-03-13T08:42:57+00:00"},
+                ],
+            )
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get("Cache-Control"), None)
+            self.assertEqual(response.data.get("additions"), 3)
+            self.assertEqual(response.data.get("updates"), 0)
+
+    def test_xls_import(self):
+        with HTTMock(enketo_mock):
+            xls_path = os.path.join(
+                settings.PROJECT_ROOT,
+                "apps",
+                "main",
+                "tests",
+                "fixtures",
+                "tutorial.xlsx",
+            )
+            self._publish_xls_form_to_project(xlsform_path=xls_path)
+            view = XFormViewSet.as_view({"post": "data_import"})
+            xls_import = fixtures_path("good.xlsx")
+
+            post_data = {"xls_file": xls_import}
+            request = self.factory.post("/", data=post_data, **self.extra)
+            response = view(request, pk=self.xform.id)
+            self.assertEqual(response.status_code, 200, response.data)
+            self.assertEqual(response.get("Cache-Control"), None)
+            self.assertEqual(response.data.get("additions"), 9)
+            self.assertEqual(response.data.get("updates"), 0)
+
+    def test_csv_xls_import_errors(self):
+        with HTTMock(enketo_mock):
+            xls_path = os.path.join(
+                settings.PROJECT_ROOT,
+                "apps",
+                "main",
+                "tests",
+                "fixtures",
+                "tutorial.xlsx",
+            )
+            self._publish_xls_form_to_project(xlsform_path=xls_path)
+            view = XFormViewSet.as_view({"post": "data_import"})
+
+            csv_import = fixtures_path("good.csv")
+            xls_import = fixtures_path("good.xlsx")
+
+            post_data = {"xls_file": csv_import}
+            request = self.factory.post("/", data=post_data, **self.extra)
+            response = view(request, pk=self.xform.id)
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.data.get("error"), "xls_file not an excel file")
+
+            post_data = {"csv_file": xls_import}
+            request = self.factory.post("/", data=post_data, **self.extra)
+            response = view(request, pk=self.xform.id)
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.data.get("error"), "csv_file not a csv file")
+
+    @override_settings(TIME_ZONE="UTC")
+    def test_get_single_registration_form(self):
+        """Response a for an XForm contributing entities is correct"""
+        # Publish registration form
+        xform = self._publish_registration_form(self.user)
+        view = XFormViewSet.as_view({"get": "retrieve"})
+        request = self.factory.get("/", **self.extra)
+        response = view(request, pk=xform.pk)
+        self.assertEqual(response.status_code, 200)
+        entity_list = EntityList.objects.get(name="trees")
+        expected_data = {
+            "url": f"http://testserver/api/v1/forms/{xform.pk}",
+            "formid": xform.pk,
+            "metadata": [],
+            "owner": "http://testserver/api/v1/users/bob",
+            "created_by": "http://testserver/api/v1/users/bob",
+            "public": False,
+            "public_data": False,
+            "public_key": "",
+            "require_auth": False,
+            "submission_count_for_today": 0,
+            "tags": [],
+            "title": xform.title,
+            "users": [
+                {
+                    "is_org": False,
+                    "metadata": {},
+                    "first_name": "Bob",
+                    "last_name": "erama",
+                    "user": "bob",
+                    "role": "owner",
+                }
+            ],
+            "enketo_url": None,
+            "enketo_preview_url": None,
+            "enketo_single_submit_url": None,
+            "num_of_submissions": 0,
+            "last_submission_time": None,
+            "form_versions": [],
+            "data_views": [],
+            "xls_available": False,
+            "contributes_entities_to": {
+                "id": entity_list.pk,
+                "name": "trees",
+                "is_active": True,
+            },
+            "consumes_entities_from": [],
+            "description": "",
+            "downloadable": True,
+            "allows_sms": False,
+            "encrypted": False,
+            "sms_id_string": xform.sms_id_string,
+            "id_string": xform.id_string,
+            "date_created": xform.date_created.isoformat().replace("+00:00", "Z"),
+            "date_modified": xform.date_modified.isoformat().replace("+00:00", "Z"),
+            "uuid": xform.uuid,
+            "bamboo_dataset": "",
+            "instances_with_geopoints": False,
+            "instances_with_osm": False,
+            "version": xform.version,
+            "has_hxl_support": False,
+            "last_updated_at": xform.last_updated_at.isoformat().replace("+00:00", "Z"),
+            "hash": xform.hash,
+            "is_merged_dataset": False,
+            "is_instance_json_regenerated": False,
+            "project": f"http://testserver/api/v1/projects/{xform.project.pk}",
+        }
+        self.assertEqual(json.dumps(response.data), json.dumps(expected_data))
+
+    @override_settings(TIME_ZONE="UTC")
+    def test_get_list_registration_form(self):
+        """Getting a list of registration forms is correct"""
+        # Publish registration form
+        xform = self._publish_registration_form(self.user)
+        view = XFormViewSet.as_view({"get": "list"})
+        request = self.factory.get("/", **self.extra)
+        response = view(request)
+        self.assertEqual(response.status_code, 200)
+        entity_list = EntityList.objects.get(name="trees")
+        expected_data = [
+            {
+                "url": f"http://testserver/api/v1/forms/{xform.pk}",
+                "formid": xform.pk,
+                "owner": "http://testserver/api/v1/users/bob",
+                "created_by": "http://testserver/api/v1/users/bob",
+                "public": False,
+                "public_data": False,
+                "public_key": "",
+                "require_auth": False,
+                "tags": [],
+                "title": xform.title,
+                "users": [
+                    {
+                        "is_org": False,
+                        "metadata": {},
+                        "first_name": "Bob",
+                        "last_name": "erama",
+                        "user": "bob",
+                        "role": "owner",
+                    }
+                ],
+                "enketo_url": None,
+                "enketo_preview_url": None,
+                "enketo_single_submit_url": None,
+                "num_of_submissions": 0,
+                "last_submission_time": None,
+                "data_views": [],
+                "xls_available": False,
+                "contributes_entities_to": {
+                    "id": entity_list.pk,
+                    "name": "trees",
+                    "is_active": True,
+                },
+                "consumes_entities_from": [],
+                "description": "",
+                "downloadable": True,
+                "allows_sms": False,
+                "encrypted": False,
+                "sms_id_string": xform.sms_id_string,
+                "id_string": xform.id_string,
+                "date_created": xform.date_created.isoformat().replace("+00:00", "Z"),
+                "date_modified": xform.date_modified.isoformat().replace("+00:00", "Z"),
+                "uuid": xform.uuid,
+                "bamboo_dataset": "",
+                "instances_with_geopoints": False,
+                "instances_with_osm": False,
+                "version": xform.version,
+                "has_hxl_support": False,
+                "last_updated_at": xform.last_updated_at.isoformat().replace(
+                    "+00:00", "Z"
+                ),
+                "hash": xform.hash,
+                "is_merged_dataset": False,
+                "is_instance_json_regenerated": False,
+                "project": f"http://testserver/api/v1/projects/{xform.project.pk}",
+            }
+        ]
+        self.assertEqual(json.dumps(response.data), json.dumps(expected_data))
+
+    @override_settings(TIME_ZONE="UTC")
+    def test_get_single_follow_up_form(self):
+        """Response a for an XForm consuming entities is correct"""
+        self._project_create()
+        entity_list = EntityList.objects.create(name="trees", project=self.project)
+        xform = self._publish_follow_up_form(self.user, self.project)
+        view = XFormViewSet.as_view({"get": "retrieve"})
+        request = self.factory.get("/", **self.extra)
+        response = view(request, pk=xform.pk)
+        self.assertEqual(response.status_code, 200)
+        metadata = MetaData.objects.order_by("-pk").first()
+        expected_data = {
+            "url": f"http://testserver/api/v1/forms/{xform.pk}",
+            "formid": xform.pk,
+            "metadata": [
+                OrderedDict(
+                    [
+                        ("id", metadata.pk),
+                        ("xform", xform.pk),
+                        ("data_value", f"entity_list {entity_list.pk} trees"),
+                        ("data_type", "media"),
+                        ("data_file", None),
+                        ("extra_data", {}),
+                        ("data_file_type", None),
+                        ("media_url", None),
+                        ("file_hash", None),
+                        ("url", f"http://testserver/api/v1/metadata/{metadata.pk}"),
+                        ("date_created", metadata.date_created),
+                    ]
+                )
+            ],
+            "owner": "http://testserver/api/v1/users/bob",
+            "created_by": "http://testserver/api/v1/users/bob",
+            "public": False,
+            "public_data": False,
+            "public_key": "",
+            "require_auth": False,
+            "submission_count_for_today": 0,
+            "tags": [],
+            "title": xform.title,
+            "users": [
+                {
+                    "is_org": False,
+                    "metadata": {},
+                    "first_name": "Bob",
+                    "last_name": "erama",
+                    "user": "bob",
+                    "role": "owner",
+                }
+            ],
+            "enketo_url": None,
+            "enketo_preview_url": None,
+            "enketo_single_submit_url": None,
+            "num_of_submissions": 0,
+            "last_submission_time": None,
+            "form_versions": [],
+            "data_views": [],
+            "xls_available": False,
+            "contributes_entities_to": None,
+            "consumes_entities_from": [
+                {
+                    "id": entity_list.pk,
+                    "name": "trees",
+                    "is_active": True,
+                }
+            ],
+            "description": "",
+            "downloadable": True,
+            "allows_sms": False,
+            "encrypted": False,
+            "sms_id_string": xform.sms_id_string,
+            "id_string": xform.id_string,
+            "date_created": xform.date_created.isoformat().replace("+00:00", "Z"),
+            "date_modified": xform.date_modified.isoformat().replace("+00:00", "Z"),
+            "uuid": xform.uuid,
+            "bamboo_dataset": "",
+            "instances_with_geopoints": False,
+            "instances_with_osm": False,
+            "version": xform.version,
+            "has_hxl_support": False,
+            "last_updated_at": xform.last_updated_at.isoformat().replace("+00:00", "Z"),
+            "hash": xform.hash,
+            "is_merged_dataset": False,
+            "is_instance_json_regenerated": False,
+            "project": f"http://testserver/api/v1/projects/{xform.project.pk}",
+        }
+        self.assertEqual(response.data, expected_data)
+
+    @override_settings(TIME_ZONE="UTC")
+    def test_get_list_follow_up_form(self):
+        """Getting a list of follow up forms is correct"""
+        # Publish registration form
+        self._project_create()
+        entity_list = EntityList.objects.create(name="trees", project=self.project)
+        xform = self._publish_follow_up_form(self.user, self.project)
+        view = XFormViewSet.as_view({"get": "list"})
+        request = self.factory.get("/", **self.extra)
+        response = view(request)
+        self.assertEqual(response.status_code, 200)
+        entity_list = EntityList.objects.get(name="trees")
+        expected_data = [
+            {
+                "url": f"http://testserver/api/v1/forms/{xform.pk}",
+                "formid": xform.pk,
+                "owner": "http://testserver/api/v1/users/bob",
+                "created_by": "http://testserver/api/v1/users/bob",
+                "public": False,
+                "public_data": False,
+                "public_key": "",
+                "require_auth": False,
+                "tags": [],
+                "title": xform.title,
+                "users": [
+                    {
+                        "is_org": False,
+                        "metadata": {},
+                        "first_name": "Bob",
+                        "last_name": "erama",
+                        "user": "bob",
+                        "role": "owner",
+                    }
+                ],
+                "enketo_url": None,
+                "enketo_preview_url": None,
+                "enketo_single_submit_url": None,
+                "num_of_submissions": 0,
+                "last_submission_time": None,
+                "data_views": [],
+                "xls_available": False,
+                "contributes_entities_to": None,
+                "consumes_entities_from": [
+                    {
+                        "id": entity_list.pk,
+                        "name": "trees",
+                        "is_active": True,
+                    }
+                ],
+                "description": "",
+                "downloadable": True,
+                "allows_sms": False,
+                "encrypted": False,
+                "sms_id_string": xform.sms_id_string,
+                "id_string": xform.id_string,
+                "date_created": xform.date_created.isoformat().replace("+00:00", "Z"),
+                "date_modified": xform.date_modified.isoformat().replace("+00:00", "Z"),
+                "uuid": xform.uuid,
+                "bamboo_dataset": "",
+                "instances_with_geopoints": False,
+                "instances_with_osm": False,
+                "version": xform.version,
+                "has_hxl_support": False,
+                "last_updated_at": xform.last_updated_at.isoformat().replace(
+                    "+00:00", "Z"
+                ),
+                "hash": xform.hash,
+                "is_merged_dataset": False,
+                "is_instance_json_regenerated": False,
+                "project": f"http://testserver/api/v1/projects/{xform.project.pk}",
+            }
+        ]
+        self.assertEqual(json.dumps(response.data), json.dumps(expected_data))
+
+
+class ExportAsyncTestCase(XFormViewSetBaseTestCase):
+    """Tests for exporting form data asynchronously"""
+
+    def _google_credentials_mock(self):
+        """Returns a mock of a Google Credentials instance"""
+
+        class GoogleCredentialsMock:
+            def to_json(self):
+                return {
+                    "refresh_token": "refresh-token",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "client_id": "client-id",
+                    "client_secret": "client-secret",
+                    "scopes": ["https://www.googleapis.com/auth/drive.file"],
+                    "expiry": datetime(2016, 8, 18, 12, 43, 30, 316792),
+                }
+
+        return GoogleCredentialsMock()
+
+    def setUp(self):
+        super().setUp()
+
+        self.view = XFormViewSet.as_view({"get": "export_async"})
+
+    def test_authentication(self):
+        """Authentication is required"""
+        self._publish_xls_form_to_project()
+        request = self.factory.get("/")
+        response = self.view(request, pk=self.xform.pk)
+        self.assertEqual(response.status_code, 404)
+
+    @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
+    @patch("onadata.libs.utils.api_export_tools.AsyncResult")
+    def test_export_form_data_async(self, async_result):
+        with HTTMock(enketo_mock):
+            self._publish_xls_form_to_project()
+            view = XFormViewSet.as_view(
+                {
+                    "get": "export_async",
+                }
+            )
+            formid = self.xform.pk
+
+            for format in ["xlsx", "osm", "csv"]:
+                request = self.factory.get("/", data={"format": format}, **self.extra)
+                response = view(request, pk=formid)
+                self.assertIsNotNone(response.data)
+                self.assertEqual(response.status_code, 202)
+                self.assertTrue("job_uuid" in response.data)
+                task_id = response.data.get("job_uuid")
+                get_data = {"job_uuid": task_id}
+                request = self.factory.get("/", data=get_data, **self.extra)
+                response = view(request, pk=formid)
+
+                self.assertTrue(async_result.called)
+                self.assertEqual(response.status_code, 202)
+                export = Export.objects.get(task_id=task_id)
+                self.assertTrue(export.is_successful)
+
+    @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
+    @patch("onadata.libs.utils.api_export_tools.AsyncResult")
+    def test_export_zip_async(self, async_result):
+        with HTTMock(enketo_mock):
+            self._publish_xls_form_to_project()
+            self._make_submissions()
+            form_view = XFormViewSet.as_view(
+                {
+                    "get": "retrieve",
+                }
+            )
+            export_async_view = XFormViewSet.as_view(
+                {
+                    "get": "export_async",
+                }
+            )
+            formid = self.xform.pk
+            fmt = "zip"
+
+            request = self.factory.get("/", data={"format": fmt}, **self.extra)
+            response = export_async_view(request, pk=formid)
+            self.assertIsNotNone(response.data)
+            self.assertEqual(response.status_code, 202)
+            self.assertTrue("job_uuid" in response.data)
+            task_id = response.data.get("job_uuid")
+            get_data = {"job_uuid": task_id}
+            request = self.factory.get("/", data=get_data, **self.extra)
+            response = export_async_view(request, pk=formid)
+
+            self.assertTrue(async_result.called)
+            self.assertEqual(response.status_code, 202)
+            export = Export.objects.get(task_id=task_id)
+            self.assertTrue(export.is_successful)
+
+            request = self.factory.get("/", **self.extra)
+            response = form_view(request, pk=formid, format=fmt)
+            self.assertTrue(response.status_code, 200)
+            headers = dict(response.items())
+            content_disposition = headers["Content-Disposition"]
+            filename = filename_from_disposition(content_disposition)
+            basename, ext = os.path.splitext(filename)
+            self.assertEqual(ext, '.zip"')
+
+    @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
+    @patch("onadata.libs.utils.api_export_tools.AsyncResult")
+    def test_export_async_connection_error(self, async_result):
+        with HTTMock(enketo_mock):
+            async_result.side_effect = ConnectionError(
+                "Error opening socket: a socket error occurred"
+            )
+            self._publish_xls_form_to_project()
+            view = XFormViewSet.as_view(
+                {
+                    "get": "export_async",
+                }
+            )
+            formid = self.xform.pk
+            format = "xlsx"
+            request = self.factory.get("/", data={"format": format}, **self.extra)
+            response = view(request, pk=formid)
+            self.assertIsNotNone(response.data)
+            self.assertEqual(response.status_code, 202)
+            self.assertTrue("job_uuid" in response.data)
+            task_id = response.data.get("job_uuid")
+            get_data = {"job_uuid": task_id}
+            request = self.factory.get("/", data=get_data, **self.extra)
+            response = view(request, pk=formid)
+
+            self.assertTrue(async_result.called)
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.status_text.upper(), "SERVICE UNAVAILABLE")
+            self.assertEqual(
+                response.data["detail"],
+                "Service temporarily unavailable, try again later.",
+            )
+            export = Export.objects.get(task_id=task_id)
+            self.assertTrue(export.is_successful)
+
+    @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
+    @patch("onadata.libs.utils.api_export_tools.AsyncResult")
+    def test_create_xls_report_async(self, async_result):
+        with HTTMock(enketo_mock):
+            self._publish_xls_form_to_project()
+            self._make_submissions()
+
+            data_value = "template 1|http://xls_server"
+            self._add_form_metadata(self.xform, "external_export", data_value)
+            # pylint: disable=no-member
+            metadata = MetaData.objects.get(
+                object_id=self.xform.id, data_type="external_export"
+            )
+            paths = [
+                os.path.join(
+                    self.main_directory,
+                    "fixtures",
+                    "transportation",
+                    "instances_w_uuid",
+                    s,
+                    s + ".xml",
+                )
+                for s in ["transport_2011-07-25_19-05-36"]
+            ]
+
+            self._make_submission(paths[0])
+            view = XFormViewSet.as_view(
+                {
+                    "get": "export_async",
+                }
+            )
+            formid = self.xform.pk
+            with HTTMock(external_mock):
+                # External export
+                request = self.factory.get(
+                    "/", data={"format": "xlsx", "meta": metadata.pk}, **self.extra
+                )
+                response = view(request, pk=formid)
+
+            self.assertIsNotNone(response.data)
+            self.assertEqual(response.status_code, 202)
+            self.assertTrue("job_uuid" in response.data)
+
+            data = response.data
+            get_data = {"job_uuid": data.get("job_uuid")}
+
+            request = self.factory.get("/", data=get_data, **self.extra)
+            response = view(request, pk=formid, format="xlsx")
+            self.assertTrue(async_result.called)
+            self.assertEqual(response.status_code, 202)
+
+    @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
+    @patch("onadata.libs.utils.api_export_tools.AsyncResult")
+    def test_create_xls_report_async_with_data_id(self, async_result):
+        with HTTMock(enketo_mock):
+            self._publish_xls_form_to_project()
+            self._make_submissions()
+
+            data_value = "template 1|http://xls_server"
+            self._add_form_metadata(self.xform, "external_export", data_value)
+            # pylint: disable=no-member
+            metadata = MetaData.objects.get(
+                object_id=self.xform.id, data_type="external_export"
+            )
+            paths = [
+                os.path.join(
+                    self.main_directory,
+                    "fixtures",
+                    "transportation",
+                    "instances_w_uuid",
+                    s,
+                    s + ".xml",
+                )
+                for s in ["transport_2011-07-25_19-05-36"]
+            ]
+
+            self._make_submission(paths[0])
+            self.assertEqual(self.response.status_code, 201)
+
+            view = XFormViewSet.as_view(
+                {
+                    "get": "export_async",
+                }
+            )
+            data = {"meta": metadata.pk, "data_id": self.xform.instances.all()[0].pk}
+            formid = self.xform.pk
+            request = self.factory.get("/", data=data, **self.extra)
+            with HTTMock(external_mock):
+                # External export
+                request = self.factory.get(
+                    "/",
+                    data={
+                        "format": "xlsx",
+                        "meta": metadata.pk,
+                        "data_id": self.xform.instances.all()[0].pk,
+                    },
+                    **self.extra,
+                )
+                response = view(request, pk=formid)
+
+            self.assertIsNotNone(response.data)
+            self.assertEqual(response.status_code, 202)
+            self.assertTrue("job_uuid" in response.data)
+
+            data = response.data
+            get_data = {"job_uuid": data.get("job_uuid")}
+
+            request = self.factory.get("/", data=get_data, **self.extra)
+            response = view(request, pk=formid, format="xlsx")
+            self.assertTrue(async_result.called)
+            self.assertEqual(response.status_code, 202)
+
+    @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
+    @patch("onadata.libs.utils.api_export_tools.AsyncResult")
+    def test_export_csv_data_async_with_remove_group_name(self, async_result):
+        with HTTMock(enketo_mock):
+            self._publish_xls_form_to_project()
+
+            view = XFormViewSet.as_view(
+                {
+                    "get": "export_async",
+                }
+            )
+            formid = self.xform.pk
+
+            request = self.factory.get(
+                "/", data={"format": "csv", "remove_group_name": True}, **self.extra
+            )
+            response = view(request, pk=formid)
+            self.assertIsNotNone(response.data)
+            self.assertEqual(response.status_code, 202)
+            self.assertTrue("job_uuid" in response.data)
+            task_id = response.data.get("job_uuid")
+
+            export_pk = Export.objects.all().order_by("pk").reverse()[0].pk
+
+            # metaclaass for mocking results
+            job = type(
+                str("AsyncResultMock"), (), {"state": "SUCCESS", "result": export_pk}
+            )
+            async_result.return_value = job
+
+            get_data = {"job_uuid": task_id, "remove_group_name": True}
+            request = self.factory.get("/", data=get_data, **self.extra)
+            response = view(request, pk=formid)
+
+            export = Export.objects.last()
+            self.assertIn(str(export.pk), response.data.get("export_url"))
+
+            self.assertTrue(async_result.called)
+            self.assertEqual(response.status_code, 202)
+            export = Export.objects.get(task_id=task_id)
+            self.assertTrue(export.is_successful)
+
+    @patch("onadata.libs.utils.api_export_tools.AsyncResult")
+    def test_export_form_data_async_with_filtered_date(self, async_result):
+        with HTTMock(enketo_mock):
+            start_date = datetime(2015, 12, 2, tzinfo=timezone.utc)
+            self._make_submission_over_date_range(start_date)
+
+            first_datetime = start_date.strftime(MONGO_STRFTIME)
+            second_datetime = start_date + timedelta(days=1, hours=20)
+            query_str = (
+                '{"_submission_time": {"$gte": "'
+                + first_datetime
+                + '", "$lte": "'
+                + second_datetime.strftime(MONGO_STRFTIME)
+                + '"}}'
+            )
+            count = Export.objects.all().count()
+
+            export_view = XFormViewSet.as_view(
+                {
+                    "get": "export_async",
+                }
+            )
+            formid = self.xform.pk
+
+            for export_format in ["csv"]:
+                request = self.factory.get(
+                    "/",
+                    data={"format": export_format, "query": query_str},
+                    **self.extra,
+                )
+                response = export_view(request, pk=formid)
+                self.assertIsNotNone(response.data)
+                self.assertEqual(response.status_code, 202)
+                self.assertTrue("job_uuid" in response.data)
+                self.assertEqual(count + 1, Export.objects.all().count())
+
+                task_id = response.data.get("job_uuid")
+                get_data = {"job_uuid": task_id}
+                request = self.factory.get("/", data=get_data, **self.extra)
+                response = export_view(request, pk=formid)
+
+                self.assertTrue(async_result.called)
+                self.assertEqual(response.status_code, 202)
+                export = Export.objects.get(task_id=task_id)
+                self.assertTrue(export.is_successful)
+
+                export = Export.objects.last()
+                self.assertIn("query", export.options)
+                self.assertEqual(export.options["query"], query_str)
 
     @patch("onadata.libs.utils.api_export_tools.AsyncResult")
     def test_export_form_data_async_include_labels(self, async_result):
@@ -4960,162 +5909,7 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
                 headers = next(csv_reader)
                 self.assertIn("Is ambulance available daily or weekly?", headers)
 
-    def test_csv_exports_w_images_link(self):
-        with HTTMock(enketo_mock):
-            xlsform_path = os.path.join(
-                settings.PROJECT_ROOT,
-                "libs",
-                "tests",
-                "utils",
-                "fixtures",
-                "tutorial.xlsx",
-            )
-
-            self._publish_xls_form_to_project(xlsform_path=xlsform_path)
-            media_file = "1442323232322.jpg"
-
-            path = os.path.join(
-                settings.PROJECT_ROOT,
-                "libs",
-                "tests",
-                "utils",
-                "fixtures",
-                "tutorial",
-                "instances",
-                "uuid1",
-                media_file,
-            )
-            with open(path, "rb") as f:
-                self._make_submission(
-                    os.path.join(
-                        settings.PROJECT_ROOT,
-                        "libs",
-                        "tests",
-                        "utils",
-                        "fixtures",
-                        "tutorial",
-                        "instances",
-                        "uuid1",
-                        "submission.xml",
-                    ),
-                    media_file=f,
-                    forced_submission_time=datetime(2015, 12, 2, tzinfo=utc),
-                )
-
-            attachment_id = Attachment.objects.all().last().pk
-
-            view = XFormViewSet.as_view({"get": "retrieve"})
-
-            data = {"include_images": True}
-            # request for export again
-            request = self.factory.get("/", data=data, **self.extra)
-            response = view(request, pk=self.xform.pk, format="csv")
-            self.assertEqual(response.status_code, 200)
-
-            expected_data = [
-                "http://example.com/api/v1/files/{}?"
-                "filename=bob/attachments/{}_{}/"
-                "1442323232322.jpg".format(
-                    attachment_id, self.xform.id, self.xform.id_string
-                )
-            ]
-            key = "photo"
-            self._validate_csv_export(response, None, key, expected_data)
-
-            data = {"include_images": False}
-            # request for export again
-            request = self.factory.get("/", data=data, **self.extra)
-            response = view(request, pk=self.xform.pk, format="csv")
-            self.assertEqual(response.status_code, 200)
-
-            expected_data = [media_file]
-            self._validate_csv_export(response, None, key, expected_data)
-
-    def test_csv_export_with_and_without_labels_only(self):
-        with HTTMock(enketo_mock):
-            # create a project and form and add a submission to the form
-            self._publish_xls_form_to_project()
-            survey = self.surveys[0]
-            _submission_time = parse_datetime("2013-02-18 15:54:01Z")
-            self._make_submission(
-                os.path.join(
-                    settings.PROJECT_ROOT,
-                    "apps",
-                    "main",
-                    "tests",
-                    "fixtures",
-                    "transportation",
-                    "instances",
-                    survey,
-                    survey + ".xml",
-                ),
-                forced_submission_time=_submission_time,
-            )
-
-            view = XFormViewSet.as_view({"get": "retrieve"})
-
-            # export the sumbitted data as csv
-            request = self.factory.get("/", **self.extra)
-            response = view(request, pk=self.xform.pk, format="csv")
-            self.assertEqual(response.status_code, 200)
-
-            expected_data = ["n/a"]
-            key = "transport/available_transportation_types_to_referral_facility_other"  # noqa
-            self._validate_csv_export(response, None, key, expected_data)
-
-            # export submitted data with include_labels_only and
-            # remove_group_name set to true
-            data = {"include_labels_only": True, "remove_group_name": True}
-            request = self.factory.get("/", data=data, **self.extra)
-            response = view(request, pk=self.xform.pk, format="csv")
-            self.assertEqual(response.status_code, 200)
-            expected_data = ["n/a"]
-            key = "Is ambulance available daily or weekly?"
-            self._validate_csv_export(response, None, key, expected_data)
-
-            # assert that the next request without the options doesn't result
-            # to the same result as the previous result
-            request = self.factory.get("/", **self.extra)
-            response = view(request, pk=self.xform.pk, format="csv")
-            self.assertEqual(response.status_code, 200)
-
-            with self.assertRaises(KeyError):
-                self._validate_csv_export(response, None, key, expected_data)
-
-    def test_xform_gsheet_exports_disabled_sync_mode(self):
-        xlsform_path = os.path.join(
-            settings.PROJECT_ROOT, "libs", "tests", "utils", "fixtures", "tutorial.xlsx"
-        )
-
-        self._publish_xls_form_to_project(xlsform_path=xlsform_path)
-        for x in range(1, 9):
-            path = os.path.join(
-                settings.PROJECT_ROOT,
-                "libs",
-                "tests",
-                "utils",
-                "fixtures",
-                "tutorial",
-                "instances",
-                "uuid{}".format(x),
-                "submission.xml",
-            )
-            self._make_submission(path)
-            x += 1
-
-        view = XFormViewSet.as_view(
-            {
-                "get": "retrieve",
-            }
-        )
-
-        request = self.factory.get("/", **self.extra)
-        response = view(request, pk=self.xform.pk, format="gsheets")
-
-        text_response = '{"details": "Sheets export only supported in async mode"}'
-        self.assertEqual(response.status_code, 403)
-        self.assertEqual(response.data, text_response)
-
+    @override_settings(GOOGLE_EXPORT=True)
     @patch("onadata.libs.utils.api_export_tools._get_google_credential")
     def test_xform_gsheet_exports_authorization_url(self, mock_google_creds):
         redirect_url = "https://google.com/api/example/authorization_url"
@@ -5144,31 +5938,30 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.data, expected_response)
 
-    @flaky
-    def test_sav_zip_export_long_variable_length(self):
+    @override_settings(GOOGLE_EXPORT=False)
+    @patch("onadata.libs.utils.api_export_tools._get_google_credential")
+    def test_google_exports_setting_false(self, mock_google_creds):
+        """Google sheet export not allowed if setting.GOOGLE_EXPORT is false"""
+        mock_google_creds.return_value = self._google_credentials_mock()
         self._publish_xls_form_to_project()
-        survey = self.surveys[0]
-        _submission_time = parse_datetime("2013-02-18 15:54:01Z")
-        self._make_submission(
-            os.path.join(
-                settings.PROJECT_ROOT,
-                "apps",
-                "main",
-                "tests",
-                "fixtures",
-                "transportation",
-                "instances",
-                survey,
-                survey + ".xml",
-            ),
-            forced_submission_time=_submission_time,
-        )
+        data = {"format": "gsheets"}
+        request = self.factory.get("/", data=data, **self.extra)
+        response = self.view(request, pk=self.xform.pk)
+        expected_response = {"details": "Export format not supported"}
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.data, expected_response)
 
-        view = XFormViewSet.as_view({"get": "retrieve"})
-
-        request = self.factory.get("/", **self.extra)
-        response = view(request, pk=self.xform.pk, format="savzip")
-        self.assertEqual(response.status_code, 200)
+    @patch("onadata.libs.utils.api_export_tools._get_google_credential")
+    def test_google_exports_setting_missing(self, mock_google_creds):
+        """Google sheet export not allowed if setting.GOOGLE_EXPORT is missing"""
+        mock_google_creds.return_value = self._google_credentials_mock()
+        self._publish_xls_form_to_project()
+        data = {"format": "gsheets"}
+        request = self.factory.get("/", data=data, **self.extra)
+        response = self.view(request, pk=self.xform.pk)
+        expected_response = {"details": "Export format not supported"}
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.data, expected_response)
 
     @override_settings(CELERY_TASK_ALWAYS_EAGER=True)
     @patch("onadata.libs.utils.api_export_tools.AsyncResult")
@@ -5194,236 +5987,6 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
         self.assertEqual(response.status_code, 202)
         export = Export.objects.get(task_id=task_id)
         self.assertTrue(export.is_successful)
-
-    def test_xform_version_count(self):
-        self._publish_xls_form_to_project()
-
-        self._make_submissions()
-
-        view = XFormViewSet.as_view(
-            {
-                "get": "retrieve",
-            }
-        )
-
-        request = self.factory.get("/", **self.extra)
-        response = view(request, pk=self.xform.pk)
-
-        self.assertIn("form_versions", response.data)
-        self.assertEqual(response.data["form_versions"][0].get("total"), 4)
-
-        # soft delete an instance
-        instance = self.xform.instances.last()
-        instance.set_deleted()
-
-        # delete cache
-        safe_delete(f"{XFORM_DATA_VERSIONS}{self.xform.pk}")
-
-        request = self.factory.get("/", **self.extra)
-        response = view(request, pk=self.xform.pk)
-
-        self.assertIn("form_versions", response.data)
-        self.assertEqual(response.data["form_versions"][0].get("total"), 3)
-
-    def test_share_auto_xform_meta_perms(self):
-        with HTTMock(enketo_mock):
-            self._publish_xls_form_to_project()
-            alice_data = {"username": "alice", "email": "alice@localhost.com"}
-            alice_profile = self._create_user_profile(alice_data)
-
-            view = XFormViewSet.as_view({"post": "share"})
-            formid = self.xform.pk
-
-            data_value = "editor-minor|dataentry"
-
-            MetaData.xform_meta_permission(self.xform, data_value=data_value)
-
-            for role_class in ROLES_ORDERED:
-
-                data = {"username": "alice", "role": role_class.name}
-                request = self.factory.post("/", data=data, **self.extra)
-                response = view(request, pk=formid)
-
-                self.assertEqual(response.status_code, 204)
-
-                if role_class in [EditorRole, EditorMinorRole]:
-                    self.assertFalse(
-                        EditorRole.user_has_role(alice_profile.user, self.xform)
-                    )
-                    self.assertTrue(
-                        EditorMinorRole.user_has_role(alice_profile.user, self.xform)
-                    )
-
-                elif role_class in [
-                    DataEntryRole,
-                    DataEntryMinorRole,
-                    DataEntryOnlyRole,
-                ]:
-                    self.assertTrue(
-                        DataEntryRole.user_has_role(alice_profile.user, self.xform)
-                    )
-
-                else:
-                    self.assertTrue(
-                        role_class.user_has_role(alice_profile.user, self.xform)
-                    )
-
-    def test_csv_export_with_meta_perms(self):
-        with HTTMock(enketo_mock):
-            self._publish_xls_form_to_project()
-
-            for survey in self.surveys:
-                _submission_time = parse_datetime("2013-02-18 15:54:01Z")
-                self._make_submission(
-                    os.path.join(
-                        settings.PROJECT_ROOT,
-                        "apps",
-                        "main",
-                        "tests",
-                        "fixtures",
-                        "transportation",
-                        "instances",
-                        survey,
-                        survey + ".xml",
-                    ),
-                    forced_submission_time=_submission_time,
-                )
-
-            alice_data = {"username": "alice", "email": "alice@localhost.com"}
-            alice_profile = self._create_user_profile(alice_data)
-
-            data_value = "editor|dataentry-minor"
-            MetaData.xform_meta_permission(self.xform, data_value=data_value)
-
-            DataEntryMinorRole.add(alice_profile.user, self.xform)
-
-            for i in self.xform.instances.all()[:2]:
-                i.user = alice_profile.user
-                i.save()
-
-            view = XFormViewSet.as_view({"get": "retrieve"})
-
-            alices_extra = {
-                "HTTP_AUTHORIZATION": "Token %s" % alice_profile.user.auth_token.key
-            }
-
-            request = self.factory.get("/", **alices_extra)
-            response = view(request, pk=self.xform.pk, format="csv")
-            self.assertEqual(response.status_code, 200)
-
-            headers = dict(response.items())
-            self.assertEqual(headers["Content-Type"], "application/csv")
-            content_disposition = headers["Content-Disposition"]
-            filename = filename_from_disposition(content_disposition)
-            basename, ext = os.path.splitext(filename)
-            self.assertEqual(ext, ".csv")
-
-            expected_data = ["alice", "alice"]
-            key = "_submitted_by"
-            self._validate_csv_export(response, None, key, expected_data)
-
-            DataEntryOnlyRole.add(alice_profile.user, self.xform)
-
-            request = self.factory.get("/", **alices_extra)
-            response = view(request, pk=self.xform.pk, format="csv")
-            self.assertEqual(response.status_code, 404)
-
-    def test_csv_export_cache(self):
-        with HTTMock(enketo_mock):
-            self._publish_xls_form_to_project()
-            self._make_submissions()
-
-            count = Export.objects.all().count()
-
-            view = XFormViewSet.as_view({"get": "retrieve"})
-
-            data = {"export_type": "csv", "win_excel_utf8": False}
-
-            request = self.factory.get("/", data=data, **self.extra)
-            response = view(request, pk=self.xform.pk, format="csv")
-            self.assertEqual(response.status_code, 200)
-
-            # should generate new
-            self.assertEqual(count + 1, Export.objects.all().count())
-
-            survey = self.surveys[0]
-            self._make_submission(
-                os.path.join(
-                    settings.PROJECT_ROOT,
-                    "apps",
-                    "main",
-                    "tests",
-                    "fixtures",
-                    "transportation",
-                    "instances",
-                    survey,
-                    survey + ".xml",
-                )
-            )
-
-            data = {"export_type": "csv", "win_excel_utf8": True}
-
-            request = self.factory.get("/", data=data, **self.extra)
-            response = view(request, pk=self.xform.pk, format="csv")
-            self.assertEqual(response.status_code, 200)
-
-            # changed options, should generate new
-            self.assertEqual(count + 2, Export.objects.all().count())
-
-            data = {"export_type": "csv", "win_excel_utf8": False}
-
-            request = self.factory.get("/", data=data, **self.extra)
-            response = view(request, pk=self.xform.pk, format="csv")
-            self.assertEqual(response.status_code, 200)
-
-            # reused options, should generate new with new submission
-            self.assertEqual(count + 3, Export.objects.all().count())
-
-    def test_upload_xml_form_file(self):
-        with HTTMock(enketo_mock):
-            path = os.path.join(
-                os.path.dirname(__file__), "..", "fixtures", "forms", "contributions"
-            )
-            form_path = os.path.join(path, "contributions.xml")
-
-            xforms = XForm.objects.count()
-            view = XFormViewSet.as_view({"post": "create"})
-
-            with open(form_path, encoding="utf-8") as xml_file:
-                post_data = {"xml_file": xml_file}
-                request = self.factory.post("/", data=post_data, **self.extra)
-                response = view(request)
-                self.assertEqual(xforms + 1, XForm.objects.count())
-                self.assertEqual(response.status_code, 201)
-
-            instances_path = os.path.join(path, "instances")
-            for uuid in os.listdir(instances_path):
-                s_path = os.path.join(instances_path, uuid, "submission.xml")
-                self._make_submission(s_path)
-            xform = XForm.objects.last()
-            self.assertEqual(xform.instances.count(), 6)
-
-    def test_created_by_field_on_cloned_forms(self):
-        """
-        Test that the created by field is not empty for cloned forms
-        """
-        with HTTMock(enketo_mock):
-            self._publish_xls_form_to_project()
-            view = XFormViewSet.as_view({"post": "clone"})
-            alice_data = {"username": "alice", "email": "alice@localhost.com"}
-            alice_profile = self._create_user_profile(alice_data)
-            count = XForm.objects.count()
-
-            data = {"username": "alice"}
-            formid = self.xform.pk
-            ManagerRole.add(self.user, alice_profile)
-            request = self.factory.post("/", data=data, **self.extra)
-            response = view(request, pk=formid)
-            self.assertTrue(self.user.has_perm("can_add_xform", alice_profile))
-            self.assertEqual(response.status_code, 201)
-            self.assertEqual(count + 1, XForm.objects.count())
-            cloned_form = XForm.objects.last()
-            self.assertEqual(cloned_form.created_by.username, "alice")
 
     @override_settings(CELERY_TASK_ALWAYS_EAGER=False)
     @patch("onadata.libs.utils.api_export_tools.AsyncResult")
@@ -5460,120 +6023,6 @@ nhMo+jI88L3qfm4/rtWKuQ9/a268phlNj34uQeoDDHuRViQo00L5meE/pFptm
             self.assertEqual(response.status_code, 202)
             export = Export.objects.get(task_id=task_id)
             self.assertTrue(export.is_pending)
-
-    def test_form_publishing_floip(self):
-        with HTTMock(enketo_mock):
-            xforms = XForm.objects.count()
-            view = XFormViewSet.as_view({"post": "create"})
-            path = os.path.join(
-                os.path.dirname(__file__),
-                "../",
-                "fixtures",
-                "flow-results-example-1.json",
-            )
-            with open(path, "rb") as xls_file:
-                post_data = {"floip_file": xls_file}
-                request = self.factory.post("/", data=post_data, **self.extra)
-                response = view(request)
-                self.assertEqual(response.status_code, 201, response.data)
-                self.assertEqual(xforms + 1, XForm.objects.count())
-
-    def test_xls_import(self):
-        with HTTMock(enketo_mock):
-            xls_path = os.path.join(
-                settings.PROJECT_ROOT,
-                "apps",
-                "main",
-                "tests",
-                "fixtures",
-                "tutorial.xlsx",
-            )
-            self._publish_xls_form_to_project(xlsform_path=xls_path)
-            view = XFormViewSet.as_view({"post": "data_import"})
-            xls_import = fixtures_path("good.xlsx")
-
-            post_data = {"xls_file": xls_import}
-            request = self.factory.post("/", data=post_data, **self.extra)
-            response = view(request, pk=self.xform.id)
-            self.assertEqual(response.status_code, 200, response.data)
-            self.assertEqual(response.get("Cache-Control"), None)
-            self.assertEqual(response.data.get("additions"), 9)
-            self.assertEqual(response.data.get("updates"), 0)
-
-    def test_external_choice_integer_name_xlsform(self):
-        """Test that names with integers are converted to strings"""
-        with HTTMock(enketo_urls_mock):
-            view = XFormViewSet.as_view({"post": "create"})
-            path = os.path.join(
-                settings.PROJECT_ROOT,
-                "apps",
-                "api",
-                "tests",
-                "fixtures",
-                "integer_name_test.xlsx",
-            )
-            with open(path, "rb") as xls_file:
-                # pylint: disable=no-member
-                meta_count = MetaData.objects.count()
-                post_data = {"xls_file": xls_file}
-                request = self.factory.post("/", data=post_data, **self.extra)
-                response = view(request)
-                xform = self.user.xforms.all()[0]
-                self.assertEqual(response.status_code, 201)
-                self.assertEqual(meta_count + 4, MetaData.objects.count())
-                metadata = MetaData.objects.get(
-                    object_id=xform.id, data_value="itemsets.csv"
-                )
-                self.assertIsNotNone(metadata)
-
-                csv_reader = csv.reader(codecs.iterdecode(metadata.data_file, "utf-8"))
-                expected_data = [
-                    ["list_name", "name", "label", "state", "county"],
-                    ["states", "1", "Texas", "", ""],
-                    ["states", "2", "Washington", "", ""],
-                    ["counties", "b1", "King", "2", ""],
-                    ["counties", "b2", "Pierce", "2", ""],
-                    ["counties", "b3", "King", "1", ""],
-                    ["counties", "b4", "Cameron", "1", ""],
-                    ["cities", "dumont", "Dumont", "1", "b3"],
-                    ["cities", "finney", "Finney", "1", "b3"],
-                    ["cities", "brownsville", "brownsville", "1", "b4"],
-                    ["cities", "harlingen", "harlingen", "1", "b4"],
-                    ["cities", "seattle", "Seattle", "2", "b3"],
-                    ["cities", "redmond", "Redmond", "2", "b3"],
-                    ["cities", "tacoma", "Tacoma", "2", "b2"],
-                    ["cities", "puyallup", "Puyallup", "2", "b2"],
-                ]
-                for index, row in enumerate(csv_reader):
-                    self.assertEqual(row, expected_data[index])
-
-    def test_csv_xls_import_errors(self):
-        with HTTMock(enketo_mock):
-            xls_path = os.path.join(
-                settings.PROJECT_ROOT,
-                "apps",
-                "main",
-                "tests",
-                "fixtures",
-                "tutorial.xlsx",
-            )
-            self._publish_xls_form_to_project(xlsform_path=xls_path)
-            view = XFormViewSet.as_view({"post": "data_import"})
-
-            csv_import = fixtures_path("good.csv")
-            xls_import = fixtures_path("good.xlsx")
-
-            post_data = {"xls_file": csv_import}
-            request = self.factory.post("/", data=post_data, **self.extra)
-            response = view(request, pk=self.xform.id)
-            self.assertEqual(response.status_code, 400)
-            self.assertEqual(response.data.get("error"), "xls_file not an excel file")
-
-            post_data = {"csv_file": xls_import}
-            request = self.factory.post("/", data=post_data, **self.extra)
-            response = view(request, pk=self.xform.id)
-            self.assertEqual(response.status_code, 400)
-            self.assertEqual(response.data.get("error"), "csv_file not a csv file")
 
     def test_export_csvzip_form_data_async(self):
         with HTTMock(enketo_mock):

@@ -2,10 +2,15 @@
 """
 DataDictionary model.
 """
-import os
-from io import BytesIO, StringIO
 
+import importlib
+import json
+import os
+from io import BytesIO
+
+from django.contrib.contenttypes.models import ContentType
 from django.core.files.uploadedfile import InMemoryUploadedFile
+from django.db import transaction
 from django.db.models.signals import post_save, pre_save
 from django.utils import timezone
 from django.utils.translation import gettext as _
@@ -14,13 +19,20 @@ import openpyxl
 import unicodecsv as csv
 from floip import FloipSurvey
 from kombu.exceptions import OperationalError
-from pyxform.builder import create_survey_element_from_dict
 from pyxform.utils import has_external_choices
-from pyxform.xls2json import parse_file_to_json
 from pyxform.xls2json_backends import xlsx_value_to_str
 
-from onadata.apps.logger.models.xform import XForm, check_version_set, check_xform_uuid
+from onadata.apps.logger.models.entity_list import EntityList
+from onadata.apps.logger.models.follow_up_form import FollowUpForm
+from onadata.apps.logger.models.registration_form import RegistrationForm
+from onadata.apps.logger.models.xform import (
+    XForm,
+    check_version_set,
+    check_xform_uuid,
+    get_survey_from_file_object,
+)
 from onadata.apps.logger.xform_instance_parser import XLSFormError
+from onadata.apps.main.models.meta_data import MetaData
 from onadata.libs.utils.cache_tools import (
     PROJ_BASE_FORMS_CACHE,
     PROJ_FORMS_CACHE,
@@ -29,7 +41,7 @@ from onadata.libs.utils.cache_tools import (
 from onadata.libs.utils.model_tools import get_columns_with_hxl, set_uuid
 
 
-def is_newline_error(e):
+def is_newline_error(error):
     """
     Return True is e is a new line error based on the error text.
     Otherwise return False.
@@ -38,32 +50,24 @@ def is_newline_error(e):
         "new-line character seen in unquoted field - do you need"
         " to open the file in universal-newline mode?"
     )
-    return newline_error == str(e)
+    return newline_error == str(error)
+
+
+def process_xlsform_survey(xls, default_name):
+    """
+    Process XLSForm file and return the PyXForm Survey for the XLSForm.
+    """
+    # FLOW Results package is a JSON file.
+    if xls.name.endswith("json"):
+        return FloipSurvey(xls).survey.to_json_dict()
+    return get_survey_from_file_object(xls, name=default_name)
 
 
 def process_xlsform(xls, default_name):
     """
     Process XLSForm file and return the survey dictionary for the XLSForm.
     """
-    # FLOW Results package is a JSON file.
-    if xls.name.endswith("json"):
-        return FloipSurvey(xls).survey.to_json_dict()
-
-    file_object = xls
-    if xls.name.endswith("csv"):
-        file_object = None
-        if not isinstance(xls.name, InMemoryUploadedFile):
-            file_object = StringIO(xls.read().decode("utf-8"))
-    try:
-        return parse_file_to_json(xls.name, file_object=file_object)
-    except csv.Error as e:
-        if is_newline_error(e):
-            xls.seek(0)
-            file_object = StringIO("\n".join(xls.read().splitlines()))
-            return parse_file_to_json(
-                xls.name, default_name=default_name, file_object=file_object
-            )
-        raise e
+    return process_xlsform_survey(xls, default_name).to_json_dict()
 
 
 # adopted from pyxform.utils.sheet_to_csv
@@ -77,11 +81,10 @@ def sheet_to_csv(xls_content, sheet_name):
     :returns: a (StringIO) csv file object
     """
     workbook = openpyxl.load_workbook(xls_content)
-
-    sheet = workbook.get_sheet_by_name(sheet_name)
+    sheet = workbook[sheet_name]
 
     if not sheet or sheet.max_column < 2:
-        raise Exception(_(f"Sheet <'{sheet_name}'> has no data."))
+        raise ValueError(_(f"Sheet <'{sheet_name}'> has no data."))
 
     csv_file = BytesIO()
 
@@ -132,10 +135,10 @@ class DataDictionary(XForm):  # pylint: disable=too-many-instance-attributes
 
         if self.xls and not skip_xls_read:
             default_name = None if not self.pk else self.survey.xml_instance().tagName
-            survey_dict = process_xlsform(self.xls, default_name)
+            survey = process_xlsform_survey(self.xls, default_name)
+            survey_dict = survey.to_json_dict()
             if has_external_choices(survey_dict):
                 self.has_external_choices = True
-            survey = create_survey_element_from_dict(survey_dict)
             survey = check_version_set(survey)
             if get_columns_with_hxl(survey.get("children")):
                 self.has_hxl_support = True
@@ -182,7 +185,11 @@ class DataDictionary(XForm):  # pylint: disable=too-many-instance-attributes
         super().save(*args, **kwargs)
 
     def file_name(self):
-        return os.path.split(self.xls.name)[-1]
+        return (
+            os.path.split(self.xls.name)[-1]
+            if self.xls.name is not None
+            else self.id_string + ".xml"
+        )
 
 
 # pylint: disable=unused-argument
@@ -191,11 +198,6 @@ def set_object_permissions(sender, instance=None, created=False, **kwargs):
     Apply the relevant object permissions for the form to all users who should
     have access to it.
     """
-    if instance.project:
-        # clear cache
-        safe_delete(f"{PROJ_FORMS_CACHE}{instance.project.pk}")
-        safe_delete(f"{PROJ_BASE_FORMS_CACHE}{instance.project.pk}")
-
     # seems the super is not called, have to get xform from here
     xform = XForm.objects.get(pk=instance.pk)
 
@@ -214,7 +216,11 @@ def set_object_permissions(sender, instance=None, created=False, **kwargs):
         )  # noqa
 
         try:
-            set_project_perms_to_xform_async.delay(xform.pk, instance.project.pk)
+            transaction.on_commit(
+                lambda: set_project_perms_to_xform_async.delay(
+                    xform.pk, instance.project.pk
+                )
+            )
         except OperationalError:
             # pylint: disable=import-outside-toplevel
             from onadata.libs.utils.project_utils import (
@@ -225,16 +231,13 @@ def set_object_permissions(sender, instance=None, created=False, **kwargs):
 
     if hasattr(instance, "has_external_choices") and instance.has_external_choices:
         instance.xls.seek(0)
-        f = sheet_to_csv(instance.xls, "external_choices")
-        f.seek(0, os.SEEK_END)
-        size = f.tell()
-        f.seek(0)
-
-        # pylint: disable=import-outside-toplevel
-        from onadata.apps.main.models.meta_data import MetaData
+        choices_file = sheet_to_csv(instance.xls, "external_choices")
+        choices_file.seek(0, os.SEEK_END)
+        size = choices_file.tell()
+        choices_file.seek(0)
 
         data_file = InMemoryUploadedFile(
-            file=f,
+            file=choices_file,
             field_name="data_file",
             name="itemsets.csv",
             content_type="text/csv",
@@ -263,4 +266,184 @@ def save_project(sender, instance=None, created=False, **kwargs):
 
 pre_save.connect(
     save_project, sender=DataDictionary, dispatch_uid="save_project_datadictionary"
+)
+
+
+def create_registration_form(sender, instance=None, created=False, **kwargs):
+    """Create a RegistrationForm for a form that defines entities
+
+    Create an EntityList if it does not exist. If it exists, use the
+    the existing EntityList
+    """
+    instance_json = instance.json
+
+    if isinstance(instance_json, str):
+        instance_json = json.loads(instance_json)
+
+    if not instance_json.get("entity_features"):
+        return
+
+    children = instance_json.get("children", [])
+    meta_list = filter(lambda child: child.get("name") == "meta", children)
+
+    for meta in meta_list:
+        for child in meta.get("children", []):
+            if child.get("name") == "entity":
+                parameters = child.get("parameters", {})
+                dataset = parameters.get("dataset")
+                entity_list, _ = EntityList.objects.get_or_create(
+                    name=dataset, project=instance.project
+                )
+                (
+                    registration_form,
+                    registration_form_created,
+                ) = RegistrationForm.objects.get_or_create(
+                    entity_list=entity_list,
+                    xform=instance,
+                )
+
+                if registration_form_created:
+                    # RegistrationForm contributing to any previous
+                    # EntityList should be disabled
+                    for form in instance.registration_forms.exclude(
+                        entity_list=entity_list, is_active=True
+                    ):
+                        form.is_active = False
+                        form.save()
+                elif not registration_form_created and not registration_form.is_active:
+                    # If previously disabled, enable it
+                    registration_form.is_active = True
+                    registration_form.save()
+
+                return
+
+
+post_save.connect(
+    create_registration_form,
+    sender=DataDictionary,
+    dispatch_uid="create_registration_form_datadictionary",
+)
+
+
+def create_follow_up_form(sender, instance=None, created=False, **kwargs):
+    """Create a FollowUpForm for a form that consumes entities
+
+    Check if a form consumes data from a dataset that is an EntityList. If so,
+    we create a FollowUpForm
+    """
+    instance_json = instance.json
+
+    if isinstance(instance_json, str):
+        instance_json = json.loads(instance_json)
+
+    children = instance_json.get("children", [])
+    active_entity_datasets: list[str] = []
+    xform = XForm.objects.get(pk=instance.pk)
+
+    for child in children:
+        if child["type"] == "select one" and "itemset" in child:
+            dataset_name = child["itemset"].split(".")[0]
+
+            try:
+                entity_list = EntityList.objects.get(
+                    name=dataset_name, project=instance.project
+                )
+
+            except EntityList.DoesNotExist:
+                # No EntityList dataset was found with the specified
+                # name, we simply do nothing
+                continue
+
+            active_entity_datasets.append(entity_list.name)
+            follow_up_form, created = FollowUpForm.objects.get_or_create(
+                entity_list=entity_list, xform=instance
+            )
+
+            if not created and not follow_up_form.is_active:
+                # If previously deactivated, re-activate
+                follow_up_form.is_active = True
+                follow_up_form.save()
+
+            content_type = ContentType.objects.get_for_model(xform)
+            MetaData.objects.get_or_create(
+                object_id=xform.pk,
+                content_type=content_type,
+                data_type="media",
+                data_value=f"entity_list {entity_list.pk} {entity_list.name}",
+            )
+
+    # Deactivate the XForm's FollowUpForms whose EntityList are not
+    # referenced by the updated XForm version
+    inactive_follow_up_forms = FollowUpForm.objects.filter(xform=xform).exclude(
+        entity_list__name__in=active_entity_datasets
+    )
+    inactive_follow_up_forms.update(is_active=False)
+
+
+post_save.connect(
+    create_follow_up_form,
+    sender=DataDictionary,
+    dispatch_uid="create_follow_up_datadictionary",
+)
+
+
+def disable_registration_form(sender, instance=None, created=False, **kwargs):
+    """Disable registration form if form no longer contains entities definitions"""
+    instance_json = instance.json
+
+    if isinstance(instance_json, str):
+        instance_json = json.loads(instance_json)
+
+    if not instance_json.get("entity_features"):
+        # If form creates entities, disable the registration forms
+        for registration_form in instance.registration_forms.filter(is_active=True):
+            registration_form.is_active = False
+            registration_form.save()
+
+
+post_save.connect(
+    disable_registration_form,
+    sender=DataDictionary,
+    dispatch_uid="disable_registration_form_datadictionary",
+)
+
+
+def invalidate_caches(sender, instance=None, created=False, **kwargs):
+    """Invalidate caches"""
+    # Avoid cyclic dependency errors
+    api_tools = importlib.import_module("onadata.apps.api.tools")
+
+    xform = XForm.objects.get(pk=instance.pk)
+
+    safe_delete(f"{PROJ_FORMS_CACHE}{instance.project.pk}")
+    safe_delete(f"{PROJ_BASE_FORMS_CACHE}{instance.project.pk}")
+    api_tools.invalidate_xform_list_cache(xform)
+
+
+post_save.connect(
+    invalidate_caches,
+    sender=DataDictionary,
+    dispatch_uid="xform_invalidate_caches",
+)
+
+
+def create_or_update_export_register(sender, instance=None, created=False, **kwargs):
+    """Create or update export columns register for the form"""
+    # Avoid cyclic import by using importlib
+    logger_tasks = importlib.import_module("onadata.apps.logger.tasks")
+
+    MetaData.update_or_create_export_register(instance)
+
+    if not created:
+        transaction.on_commit(
+            lambda: logger_tasks.reconstruct_xform_export_register_async.delay(
+                instance.pk
+            )
+        )
+
+
+post_save.connect(
+    create_or_update_export_register,
+    sender=DataDictionary,
+    dispatch_uid="create_or_update_export_register",
 )

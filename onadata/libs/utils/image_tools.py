@@ -2,22 +2,22 @@
 """
 Image utility functions module.
 """
-import logging
-import urllib
-from datetime import datetime, timedelta
+
 from tempfile import NamedTemporaryFile
+from urllib.parse import quote
 from wsgiref.util import FileWrapper
 
 from django.conf import settings
 from django.core.files.base import ContentFile
-from django.core.files.storage import get_storage_class
+from django.core.files.storage import storages
 from django.http import HttpResponse, HttpResponseRedirect
 
-import boto3
-from botocore.client import Config
-from botocore.exceptions import ClientError
 from PIL import Image
 
+from onadata.libs.utils.logger_tools import (
+    generate_media_url_with_sas,
+    get_storages_media_download_url,
+)
 from onadata.libs.utils.viewer_tools import get_path
 
 
@@ -36,34 +36,17 @@ def generate_media_download_url(obj, expiration: int = 3600):
     Azure storage objects.
     """
     file_path = obj.media_file.name
-    default_storage = get_storage_class()()
-    filename = file_path.split("/")[-1]
-    content_disposition = urllib.parse.quote(f"attachment; filename={filename}")
-    s3_class = None
-    azure = None
-
-    try:
-        s3_class = get_storage_class("storages.backends.s3boto3.S3Boto3Storage")()
-    except ModuleNotFoundError:
-        pass
-
-    try:
-        azure = get_storage_class("storages.backends.azure_storage.AzureStorage")()
-    except ModuleNotFoundError:
-        pass
-
-    if isinstance(default_storage, type(s3_class)):
-        try:
-            url = generate_aws_media_url(file_path, content_disposition, expiration)
-        except ClientError as e:
-            logging.error(e)
-            return None
-        else:
-            return HttpResponseRedirect(url)
-
-    if isinstance(default_storage, type(azure)):
-        media_url = generate_media_url_with_sas(file_path, expiration)
-        return HttpResponseRedirect(media_url)
+    filename = quote(file_path.split("/")[-1])
+    # The filename is enclosed in quotes because it ensures that special characters,
+    # spaces, or punctuation in the filename are correctly interpreted by browsers
+    # and clients. This is particularly important for filenames that may contain
+    # spaces or non-ASCII characters.
+    content_disposition = f'attachment; filename="{filename}"'
+    download_url = get_storages_media_download_url(
+        file_path, content_disposition, expiration
+    )
+    if download_url is not None:
+        return HttpResponseRedirect(download_url)
 
     # pylint: disable=consider-using-with
     file_obj = open(settings.MEDIA_ROOT + file_path, "rb")
@@ -71,54 +54,6 @@ def generate_media_download_url(obj, expiration: int = 3600):
     response["Content-Disposition"] = content_disposition
 
     return response
-
-
-def generate_aws_media_url(
-    file_path: str, content_disposition: str, expiration: int = 3600
-):
-    """Generate S3 URL."""
-    s3_class = get_storage_class("storages.backends.s3boto3.S3Boto3Storage")()
-    bucket_name = s3_class.bucket.name
-    s3_config = Config(
-        signature_version=getattr(settings, "AWS_S3_SIGNATURE_VERSION", "s3v4"),
-        region_name=getattr(settings, "AWS_S3_REGION_NAME", ""),
-    )
-    s3_client = boto3.client("s3", config=s3_config)
-
-    # Generate a presigned URL for the S3 object
-    return s3_client.generate_presigned_url(
-        "get_object",
-        Params={
-            "Bucket": bucket_name,
-            "Key": file_path,
-            "ResponseContentDisposition": content_disposition,
-            "ResponseContentType": "application/octet-stream",
-        },
-        ExpiresIn=expiration,
-    )
-
-
-def generate_media_url_with_sas(file_path: str, expiration: int = 3600):
-    """
-    Generate Azure storage URL.
-    """
-    # pylint: disable=import-outside-toplevel
-    from azure.storage.blob import AccountSasPermissions, generate_blob_sas
-
-    account_name = getattr(settings, "AZURE_ACCOUNT_NAME", "")
-    container_name = getattr(settings, "AZURE_CONTAINER", "")
-    media_url = (
-        f"https://{account_name}.blob.core.windows.net/{container_name}/{file_path}"
-    )
-    sas_token = generate_blob_sas(
-        account_name=account_name,
-        account_key=getattr(settings, "AZURE_ACCOUNT_KEY", ""),
-        container_name=container_name,
-        blob_name=file_path,
-        permission=AccountSasPermissions(read=True),
-        expiry=datetime.utcnow() + timedelta(seconds=expiration),
-    )
-    return f"{media_url}?{sas_token}"
 
 
 def get_dimensions(size, longest_side):
@@ -138,24 +73,25 @@ def get_dimensions(size, longest_side):
     return flat(width, height)
 
 
-def _save_thumbnails(image, path, size, suffix, extension):
+def _save_thumbnails(image, filename, size, suffix, extension):
     with NamedTemporaryFile(suffix=f".{extension}") as temp_file:
-        default_storage = get_storage_class()()
+        default_storage = storages["default"]
 
         try:
             # Ensure conversion to float in operations
-            image.thumbnail(get_dimensions(image.size, float(size)), Image.ANTIALIAS)
+            # pylint: disable=no-member
+            image.thumbnail(get_dimensions(image.size, float(size)), Image.LANCZOS)
         except ZeroDivisionError:
             pass
 
         image.save(temp_file.name)
-        default_storage.save(get_path(path, suffix), ContentFile(temp_file.read()))
+        default_storage.save(get_path(filename, suffix), ContentFile(temp_file.read()))
         temp_file.close()
 
 
 def resize(filename, extension):
     """Resize an image into multiple sizes."""
-    default_storage = get_storage_class()()
+    default_storage = storages["default"]
 
     try:
         with default_storage.open(filename) as image_file:
@@ -171,12 +107,12 @@ def resize(filename, extension):
                     settings.DEFAULT_IMG_FILE_TYPE if extension == "non" else extension,
                 )
     except IOError as exc:
-        raise Exception("The image file couldn't be identified") from exc
+        raise ValueError("The image file couldn't be identified") from exc
 
 
 def resize_local_env(filename, extension):
     """Resize images in a local environment."""
-    default_storage = get_storage_class()()
+    default_storage = storages["default"]
     path = default_storage.path(filename)
     image = Image.open(path)
     conf = settings.THUMB_CONF
@@ -184,7 +120,7 @@ def resize_local_env(filename, extension):
     for key in settings.THUMB_ORDER:
         _save_thumbnails(
             image,
-            path,
+            filename,
             conf[key]["size"],
             conf[key]["suffix"],
             settings.DEFAULT_IMG_FILE_TYPE if extension == "non" else extension,
@@ -193,10 +129,12 @@ def resize_local_env(filename, extension):
 
 def is_azure_storage():
     """Checks if azure storage is in use"""
-    default_storage = get_storage_class()()
+    default_storage = storages["default"]
     azure = None
     try:
-        azure = get_storage_class("storages.backends.azure_storage.AzureStorage")()
+        azure = storages.create_storage(
+            {"BACKEND": "storages.backends.azure_storage.AzureStorage"}
+        )
     except ModuleNotFoundError:
         pass
     return isinstance(default_storage, type(azure))
@@ -211,8 +149,10 @@ def image_url(attachment, suffix):
     if suffix == "original":
         return url
 
-    default_storage = get_storage_class()()
-    file_storage = get_storage_class("django.core.files.storage.FileSystemStorage")()
+    default_storage = storages["default"]
+    file_storage = storages.create_storage(
+        {"BACKEND": "django.core.files.storage.FileSystemStorage"}
+    )
 
     if suffix in settings.THUMB_CONF:
         size = settings.THUMB_CONF[suffix]["suffix"]

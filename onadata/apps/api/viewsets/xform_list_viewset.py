@@ -2,17 +2,23 @@
 """
 OpenRosa Form List API - https://docs.getodk.org/openrosa-form-list/
 """
+
 from django.conf import settings
-from django.http import Http404
+from django.http import Http404, StreamingHttpResponse
 from django.shortcuts import get_object_or_404
-from django.views.decorators.cache import never_cache
 
 from django_filters import rest_framework as django_filter_filters
 from rest_framework import permissions, viewsets
+from rest_framework.authentication import TokenAuthentication
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
-from onadata.apps.api.tools import get_baseviewset_class, get_media_file_response
+from onadata.apps.api.tools import (
+    get_baseviewset_class,
+    get_media_file_response,
+    get_xform_list_cache_key,
+)
+from onadata.apps.logger.models.project import Project
 from onadata.apps.logger.models.xform import XForm, get_forms_shared_with_user
 from onadata.apps.main.models.meta_data import MetaData
 from onadata.apps.main.models.user_profile import UserProfile
@@ -28,6 +34,12 @@ from onadata.libs.renderers.renderers import (
 from onadata.libs.serializers.xform_serializer import (
     XFormListSerializer,
     XFormManifestSerializer,
+)
+from onadata.libs.utils.cache_tools import (
+    XFORM_MANIFEST_CACHE,
+    XFROM_LIST_CACHE_TTL,
+    safe_cache_get,
+    safe_cache_set,
 )
 from onadata.libs.utils.common_tags import GROUP_DELIMETER_TAG, REPEAT_INDEX_TAGS
 from onadata.libs.utils.export_builder import ExportBuilder
@@ -48,9 +60,10 @@ class XFormListViewSet(ETagsMixin, BaseViewset, viewsets.ReadOnlyModelViewSet):
     authentication_classes = (
         DigestAuthentication,
         EnketoTokenAuthentication,
+        TokenAuthentication,
     )
     content_negotiation_class = MediaFileContentNegotiation
-    filter_class = filters.FormIDFilter
+    filterset_class = filters.FormIDFilter
     filter_backends = (
         filters.XFormListObjectPermissionFilter,
         filters.XFormListXFormPKFilter,
@@ -65,6 +78,7 @@ class XFormListViewSet(ETagsMixin, BaseViewset, viewsets.ReadOnlyModelViewSet):
     renderer_classes = (XFormListRenderer,)
     serializer_class = XFormListSerializer
     template_name = "api/xformsList.xml"
+    throttle_scope = "xformlist"
 
     def get_object(self):
         queryset = self.filter_queryset(self.get_queryset())
@@ -77,11 +91,24 @@ class XFormListViewSet(ETagsMixin, BaseViewset, viewsets.ReadOnlyModelViewSet):
 
         return obj
 
-    def get_renderers(self):
-        if self.action and self.action == "manifest":
-            return [XFormManifestRenderer()]
+    def get_serializer_class(self):
+        """Return the class to use for the serializer"""
+        if self.action == "manifest":
+            return XFormManifestSerializer
 
-        return super().get_renderers()
+        return super().get_serializer_class()
+
+    def get_serializer(self, *args, **kwargs):
+        """
+        Return the serializer instance that should be used for validating and
+        deserializing input, and for serializing output.
+        """
+        if self.action == "manifest":
+            kwargs.setdefault("context", self.get_serializer_context())
+            kwargs["context"][GROUP_DELIMETER_TAG] = ExportBuilder.GROUP_DELIMITER_DOT
+            kwargs["context"][REPEAT_INDEX_TAGS] = "_,_"
+
+        return super().get_serializer(*args, **kwargs)
 
     def filter_queryset(self, queryset):
         username = self.kwargs.get("username")
@@ -136,15 +163,41 @@ class XFormListViewSet(ETagsMixin, BaseViewset, viewsets.ReadOnlyModelViewSet):
 
         return queryset
 
-    @never_cache
-    def list(self, request, *args, **kwargs):
-        # pylint: disable=attribute-defined-outside-init
-        self.object_list = self.filter_queryset(self.get_queryset())
+    def _get_xform_list_cache_key(self):
+        xform_pk = self.kwargs.get("xform_pk")
+        project_pk = self.kwargs.get("project_pk")
+        cache_key = None
 
+        if xform_pk:
+            xform = get_object_or_404(XForm, pk=xform_pk)
+            cache_key = get_xform_list_cache_key(self.request.user, xform)
+
+        elif project_pk:
+            project = get_object_or_404(Project, pk=project_pk)
+            cache_key = get_xform_list_cache_key(self.request.user, project)
+
+        return cache_key
+
+    def list(self, request, *args, **kwargs):
         headers = get_openrosa_headers(request, location=False)
-        serializer = self.get_serializer(self.object_list, many=True)
+
         if request.method in ["HEAD"]:
             return Response("", headers=headers, status=204)
+
+        cache_key = self._get_xform_list_cache_key()
+
+        if cache_key is not None:
+            cached_result = safe_cache_get(cache_key)
+
+            if cached_result is not None:
+                return Response(cached_result, headers=headers)
+
+        # pylint: disable=attribute-defined-outside-init
+        self.object_list = self.filter_queryset(self.get_queryset())
+        serializer = self.get_serializer(self.object_list, many=True)
+
+        if cache_key is not None:
+            safe_cache_set(cache_key, serializer.data, XFROM_LIST_CACHE_TTL)
 
         return Response(serializer.data, headers=headers)
 
@@ -156,21 +209,31 @@ class XFormListViewSet(ETagsMixin, BaseViewset, viewsets.ReadOnlyModelViewSet):
             self.object.xml, headers=get_openrosa_headers(request, location=False)
         )
 
-    @action(methods=["GET", "HEAD"], detail=True)
+    @action(
+        methods=["GET", "HEAD"], detail=True, renderer_classes=[XFormManifestRenderer]
+    )
     def manifest(self, request, *args, **kwargs):
         """A manifest defining additional supporting objects."""
         # pylint: disable=attribute-defined-outside-init
-        self.object = self.get_object()
-        object_list = MetaData.objects.filter(
-            data_type="media", object_id=self.object.pk
-        )
-        context = self.get_serializer_context()
-        context[GROUP_DELIMETER_TAG] = ExportBuilder.GROUP_DELIMITER_DOT
-        context[REPEAT_INDEX_TAGS] = "_,_"
-        serializer = XFormManifestSerializer(object_list, many=True, context=context)
+        xform = self.get_object()
+        cache_key = f"{XFORM_MANIFEST_CACHE}{xform.pk}"
+        cached_manifest: str | None = safe_cache_get(cache_key)
+        # Ensure a previous stream has completed updating the cache by
+        # confirm the last tag </manifest> exists
+        if cached_manifest is not None and cached_manifest.endswith("</manifest>"):
+            return Response(
+                cached_manifest,
+                content_type="text/xml; charset=utf-8",
+                headers=get_openrosa_headers(request, location=False),
+            )
 
-        return Response(
-            serializer.data, headers=get_openrosa_headers(request, location=False)
+        metadata_qs = MetaData.objects.filter(data_type="media", object_id=xform.pk)
+        renderer = XFormManifestRenderer(cache_key)
+
+        return StreamingHttpResponse(
+            renderer.stream_data(metadata_qs, self.get_serializer),
+            content_type="text/xml; charset=utf-8",
+            headers=get_openrosa_headers(request, location=False),
         )
 
     @action(methods=["GET", "HEAD"], detail=True)

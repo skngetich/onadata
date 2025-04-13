@@ -110,8 +110,8 @@ class AuditLogHandler(logging.Handler):
         # save to mongodb audit_log
         try:
             model = self.get_model(self.model_name)
-        except Exception as e:  # pylint: disable=broad-except
-            logging.exception("Get model threw exception: %s", str(e))
+        except Exception as error:  # pylint: disable=broad-except
+            logging.exception("Get model threw exception: %s", str(error))
         else:
             log_entry = model(data)
             log_entry.save()
@@ -124,7 +124,7 @@ class AuditLogHandler(logging.Handler):
         return getattr(mod, names[-1])
 
 
-# pylint: disable=too-many-arguments
+# pylint: disable=too-many-arguments, too-many-positional-arguments
 def audit_log(
     action, request_user, account_user, message, audit, request, level=logging.DEBUG
 ):
@@ -144,12 +144,12 @@ def audit_log(
     logger = logging.getLogger("audit_logger")
     extra = {
         "formhub_action": action,
-        "request_username": request_user.username
-        if request_user.username
-        else str(request_user),
-        "account_username": account_user.username
-        if account_user.username
-        else str(account_user),
+        "request_username": (
+            request_user.username if request_user.username else str(request_user)
+        ),
+        "account_username": (
+            account_user.username if account_user.username else str(account_user)
+        ),
         "client_ip": get_client_ip(request),
         "audit": audit,
     }

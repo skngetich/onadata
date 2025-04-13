@@ -3,9 +3,10 @@
 """
 move_media_to_s3 - Moves all XLSForm file from local storage to S3 storage.
 """
+
 import sys
 
-from django.core.files.storage import get_storage_class
+from django.core.files.storage import storages
 from django.core.management.base import BaseCommand
 from django.utils.translation import gettext as _, gettext_lazy
 
@@ -25,10 +26,14 @@ class Command(BaseCommand):
     # pylint: disable=unused-argument
     def handle(self, *args, **kwargs):
         """Moves all XLSForm file from local storage to S3 storage."""
-        local_fs = get_storage_class("django.core.files.storage.FileSystemStorage")()
-        s3_fs = get_storage_class("storages.backends.s3boto.S3BotoStorage")()
+        local_fs = storages.create_storage(
+            {"BACKEND": "django.core.files.storage.FileSystemStorage"}
+        )
+        s3_fs = storages.create_storage(
+            {"BACKEND": "storages.backends.s3boto.S3BotoStorage"}
+        )
 
-        default_storage = get_storage_class()()
+        default_storage = storages["default"]
         if default_storage.__class__ != s3_fs.__class__:
             self.stderr.write(
                 _(
@@ -46,22 +51,29 @@ class Command(BaseCommand):
         for cls, file_field, upload_to in classes_to_move:
             self.stdout.write(_("Moving %(class)ss to s3...") % {"class": cls.__name__})
             for i in cls.objects.all():
-                f = getattr(i, file_field)
-                old_filename = f.name
+                media_file = getattr(i, file_field)
+                old_filename = media_file.name
                 if (
-                    f.name
-                    and local_fs.exists(f.name)
-                    and not s3_fs.exists(upload_to(i, f.name))
+                    old_filename
+                    and local_fs.exists(old_filename)
+                    and not s3_fs.exists(upload_to(i, old_filename))
                 ):
-                    f.save(local_fs.path(f.name), local_fs.open(local_fs.path(f.name)))
+                    media_file.name.save(
+                        local_fs.path(old_filename),
+                        local_fs.open(local_fs.path(old_filename)),
+                    )
                     self.stdout.write(
                         _("\t+ '%(fname)s'\n\t---> '%(url)s'")
-                        % {"fname": local_fs.path(old_filename), "url": f.url}
+                        % {
+                            "fname": local_fs.path(old_filename),
+                            "url": media_file.url,
+                        }
                     )
                 else:
-                    exists_locally = local_fs.exists(f.name)
-                    exists_s3 = not s3_fs.exists(upload_to(i, f.name))
+                    exists_locally = local_fs.exists(old_filename)
+                    exists_s3 = not s3_fs.exists(upload_to(i, old_filename))
                     self.stderr.write(
-                        f"\t- (f.name={f.name}, fs.exists(f.name)={exists_locally},"
-                        f" not s3.exist s3upload_to(i, f.name))={exists_s3})"
+                        f"\t- (old_filename={old_filename}, "
+                        f"fs.exists(old_filename)={exists_locally},"
+                        f" not s3.exist s3upload_to(i, old_filename))={exists_s3})"
                     )

@@ -2,6 +2,7 @@
 """
 URLs path.
 """
+
 import sys
 
 import django
@@ -33,6 +34,7 @@ from onadata.apps.viewer import views as viewer_views
 from onadata.libs.utils.analytics import init_analytics
 
 TESTING = len(sys.argv) > 1 and sys.argv[1] == "test"
+ADMIN_URL_PATH = getattr(settings, "ADMIN_URL_PATH", "admin")
 
 admin.autodiscover()
 
@@ -50,8 +52,8 @@ urlpatterns = [
     re_path(r"^api/v1$", RedirectView.as_view(url="/api/v1/", permanent=True)),
     # django default stuff
     re_path(r"^accounts/", include(registration_patterns)),
-    re_path(r"^admin/", admin.site.urls),
-    re_path(r"^admin/doc/", include("django.contrib.admindocs.urls")),
+    re_path(f"^{ADMIN_URL_PATH}/", admin.site.urls),
+    re_path(f"^{ADMIN_URL_PATH}/doc/", include("django.contrib.admindocs.urls")),
     # oath2_provider
     re_path(
         r"^o/authorize/$",
@@ -202,7 +204,27 @@ urlpatterns = [
         name="view-submission-list",
     ),
     re_path(
+        r"^forms/(?P<xform_pk>\d+)/view/submissionList$",
+        BriefcaseViewset.as_view({"get": "list", "head": "list"}),
+        name="view-submission-list",
+    ),
+    re_path(
+        r"^projects/(?P<project_pk>\d+)/view/submissionList$",
+        BriefcaseViewset.as_view({"get": "list", "head": "list"}),
+        name="view-submission-list",
+    ),
+    re_path(
         r"^(?P<username>\w+)/view/downloadSubmission$",
+        BriefcaseViewset.as_view({"get": "retrieve", "head": "retrieve"}),
+        name="view-download-submission",
+    ),
+    re_path(
+        r"^forms/(?P<xform_pk>\d+)/view/downloadSubmission$",
+        BriefcaseViewset.as_view({"get": "retrieve", "head": "retrieve"}),
+        name="view-download-submission",
+    ),
+    re_path(
+        r"^projects/(?P<project_pk>\d+)/view/downloadSubmission$",
         BriefcaseViewset.as_view({"get": "retrieve", "head": "retrieve"}),
         name="view-download-submission",
     ),
@@ -356,17 +378,17 @@ urlpatterns = [
         name="form-list",
     ),
     re_path(
-        r"^enketo/(?P<xform_pk>\w+)/formList$",
+        r"^enketo/(?P<xform_pk>\d+)/formList$",
         XFormListViewSet.as_view({"get": "list", "head": "list"}),
         name="form-list",
     ),
     re_path(
-        r"^forms/(?P<xform_pk>\w+)/formList$",
+        r"^forms/(?P<xform_pk>\d+)/formList$",
         XFormListViewSet.as_view({"get": "list", "head": "list"}),
         name="form-list",
     ),
     re_path(
-        r"^enketo-preview/(?P<xform_pk>\w+)/formList$",
+        r"^enketo-preview/(?P<xform_pk>\d+)/formList$",
         PreviewXFormListViewSet.as_view({"get": "list", "head": "list"}),
         name="form-list",
     ),
@@ -423,17 +445,17 @@ urlpatterns = [
         name="submissions",
     ),
     re_path(
-        r"^enketo/(?P<xform_pk>\w+)/submission$",
+        r"^enketo/(?P<xform_pk>\d+)/submission$",
         XFormSubmissionViewSet.as_view({"post": "create", "head": "create"}),
         name="submissions",
     ),
     re_path(
-        r"^projects/(?P<project_pk>\w+)/submission$",
+        r"^projects/(?P<project_pk>\d+)/submission$",
         XFormSubmissionViewSet.as_view({"post": "create", "head": "create"}),
         name="submissions",
     ),
     re_path(
-        r"^forms/(?P<xform_pk>\w+)/submission$",
+        r"^forms/(?P<xform_pk>\d+)/submission$",
         XFormSubmissionViewSet.as_view({"post": "create", "head": "create"}),
         name="submissions",
     ),

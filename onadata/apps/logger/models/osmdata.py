@@ -50,8 +50,8 @@ class OsmData(models.Model):
         Returns tags prefixed by the field_name.
         """
         doc = {self.field_name + ":" + self.osm_type + ":id": self.osm_id}
-        for k, v in self.tags.items():
-            doc[self.field_name + ":" + k] = v
+        for key, value in self.tags.items():
+            doc[self.field_name + ":" + key] = value
 
         return doc
 
@@ -67,9 +67,18 @@ class OsmData(models.Model):
             )
 
     def save(
-        self, force_insert=False, force_update=False, using=None, update_fields=None
+        self,
+        *args,
+        force_insert=False,
+        force_update=False,
+        using=None,
+        update_fields=None
     ):
         self._set_centroid_in_tags()
         super().save(
-            force_insert=False, force_update=False, using=None, update_fields=None
+            *args,
+            force_insert=False,
+            force_update=False,
+            using=None,
+            update_fields=None
         )

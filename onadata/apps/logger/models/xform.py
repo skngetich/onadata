@@ -2,12 +2,15 @@
 """
 The XForm model
 """
+
 # pylint: disable=too-many-lines
 import hashlib
 import json
 import os
 import re
 from datetime import datetime
+from io import BytesIO
+from pathlib import Path
 from xml.dom import Node
 
 from django.conf import settings
@@ -24,12 +27,17 @@ from django.utils.html import conditional_escape
 from django.utils.translation import gettext as _
 from django.utils.translation import gettext_lazy
 
-import pytz
 from guardian.models import GroupObjectPermissionBase, UserObjectPermissionBase
 from pyxform import SurveyElementBuilder, constants, create_survey_element_from_dict
+from pyxform.errors import PyXFormError
 from pyxform.question import Question
 from pyxform.section import RepeatingSection
-from pyxform.xform2json import create_survey_element_from_xml
+from pyxform.xls2json import workbook_to_json
+from pyxform.xls2json_backends import (
+    SupportedFileTypes,
+    definition_to_dict,
+    get_definition_data,
+)
 from six import iteritems
 from taggit.managers import TaggableManager
 
@@ -64,6 +72,7 @@ from onadata.libs.utils.common_tags import (
     UUID,
     VERSION,
 )
+from onadata.libs.utils.common_tools import get_abbreviated_xpath
 from onadata.libs.utils.model_tools import queryset_iterator
 from onadata.libs.utils.mongo import _encode_for_mongo
 
@@ -80,6 +89,34 @@ User = get_user_model()
 def cmp(x, y):
     """Returns the difference on the comparison of ``x`` and ``y``."""
     return (x > y) - (x < y)
+
+
+def get_survey_from_file_object(
+    file_object, name=None, id_string=None, title=None, version=None
+):
+    """Returns a PyXForm object from an XLSForm file object."""
+    xlsform_file_object = BytesIO(file_object.read())
+    xlsform_file_object.name = file_object.name
+    file_path = Path(file_object.name)
+    file_type = SupportedFileTypes(file_path.suffix)
+    fallback_form_name = file_path.stem
+    xlsform_json = workbook_to_json(
+        workbook_dict=definition_to_dict(
+            definition=get_definition_data(xlsform_file_object), file_type=file_type
+        ),
+        form_name=name,
+        fallback_form_name=fallback_form_name,
+    )
+    if version and version != xlsform_json.get("version"):
+        xlsform_json["version"] = version
+
+    if title and title != xlsform_json.get("title"):
+        xlsform_json["title"] = title
+
+    if id_string and id_string != xlsform_json.get("id_string"):
+        xlsform_json["id_string"] = id_string
+
+    return SurveyElementBuilder().create_survey_element_from_dict(xlsform_json)
 
 
 def question_types_to_exclude(_type):
@@ -119,7 +156,7 @@ class DictOrganizer:
     # Every section will get its own table
     # I need to think of an easy way to flatten out a dictionary
     # parent name, index, table name, data
-    # pylint: disable=too-many-arguments
+    # pylint: disable=too-many-arguments, too-many-positional-arguments
     def _build_obs_from_dict(
         self, dict_item, obs, table_name, parent_table_name, parent_index
     ):
@@ -132,14 +169,14 @@ class DictOrganizer:
                 "_parent_index": parent_index,
             }
         )
-        for (k, v) in iteritems(dict_item):
+        for k, v in iteritems(dict_item):
             if isinstance(v, dict) and isinstance(v, list):
                 if k in obs[table_name][-1]:
                     raise AssertionError()
                 obs[table_name][-1][k] = v
         obs[table_name][-1]["_index"] = this_index
 
-        for (k, v) in iteritems(dict_item):
+        for k, v in iteritems(dict_item):
             if isinstance(v, dict):
                 kwargs = {
                     "dict_item": v,
@@ -203,15 +240,8 @@ def check_version_set(survey):
     """
 
     # get the json and check for the version key
-    survey_json = survey.to_json_dict()
-    if not survey_json.get("version"):
-        # set utc time as the default version
-        survey_json["version"] = datetime.utcnow().strftime("%Y%m%d%H%M")
-        builder = SurveyElementBuilder()
-        if isinstance(survey_json, str):
-            survey = builder.create_survey_element_from_json(survey_json)
-        elif isinstance(survey_json, dict):
-            survey = builder.create_survey_element_from_dict(survey_json)
+    if survey.version == "":
+        survey.version = datetime.utcnow().strftime("%Y%m%d%H%M")
     return survey
 
 
@@ -219,9 +249,9 @@ def _expand_select_all_that_apply(item, key, elem):
     """Split's a select multiple into individual keys"""
     if elem and elem.bind.get("type") == "string" and elem.type == MULTIPLE_SELECT_TYPE:
         options_selected = item[key].split()
-        for child in elem.children:
-            new_key = child.get_abbreviated_xpath()
-            item[new_key] = child.name in options_selected
+        for option in elem.choices.options:
+            new_key = get_abbreviated_xpath(elem.get_xpath() + option.get_xpath())
+            item[new_key] = option.name in options_selected
 
         del item[key]
 
@@ -244,8 +274,13 @@ class XFormMixin:
         file_name, _file_ext = os.path.splitext(file_name)
 
         doc = clean_and_parse_xml(self.xml)
-        model_nodes = doc.getElementsByTagName("model")
+        model_nodes = [
+            model_node
+            for model_node in doc.getElementsByTagName("model")
+            if model_node.parentNode.nodeName == "h:head"
+        ]
         if len(model_nodes) != 1:
+            # pylint: disable=broad-exception-raised
             raise Exception("xml contains multiple model nodes")
 
         model_node = model_nodes[0]
@@ -258,6 +293,7 @@ class XFormMixin:
         ]
 
         if len(instance_nodes) != 1:
+            # pylint: disable=broad-exception-raised
             raise Exception(
                 "Multiple instance nodes without the id "
                 "attribute, can't tell which is the main one"
@@ -274,6 +310,7 @@ class XFormMixin:
         ]
 
         if len(survey_nodes) != 1:
+            # pylint: disable=broad-exception-raised
             raise Exception("Multiple survey nodes with the id '{self.id_string}'")
 
         survey_node = survey_nodes[0]
@@ -284,6 +321,7 @@ class XFormMixin:
         ]
 
         if len(formhub_nodes) > 1:
+            # pylint: disable=broad-exception-raised
             raise Exception("Multiple formhub nodes within main instance node")
         if len(formhub_nodes) == 1:
             formhub_node = formhub_nodes[0]
@@ -315,11 +353,11 @@ class XFormMixin:
         # http://ronrothman.com/public/leftbraned/xml-dom-minidom-toprettyxml-\
         # and-silly-whitespace/
         text_re = re.compile(r"(>)\n\s*(\s[^<>\s].*?)\n\s*(\s</)", re.DOTALL)
-        output_re = re.compile("\n.*(<output.*>)\n(  )*")
+        output_re = re.compile(r"\n.*(<output.*>)\n(  )*")
         pretty_xml = text_re.sub(
             lambda m: "".join(m.group(1, 2, 3)), self.xml.decode("utf-8")
         )
-        inline_output = output_re.sub("\g<1>", pretty_xml)  # noqa
+        inline_output = output_re.sub(r"\g<1>", pretty_xml)  # noqa
         inline_output = re.compile(r"<label>\s*\n*\s*\n*\s*</label>").sub(
             "<label></label>", inline_output
         )
@@ -370,18 +408,49 @@ class XFormMixin:
 
         return id_string
 
+    def get_survey_from_xlsform(self):
+        """Returns the PyXForm Survey object by re-reading the XLSForm"""
+        if not self.xls:
+            return self.get_survey()
+
+        if hasattr(self, "_survey_from_xlsform"):
+            return self._survey_from_xlsform
+
+        survey = get_survey_from_file_object(
+            self.xls,
+            name=self.json["name"],
+            id_string=self.id_string,
+            title=self.title,
+            version=self.version,
+        )
+        self._survey_from_xlsform = survey
+
+        return survey
+
+    def _get_survey(self):
+        try:
+            builder = SurveyElementBuilder()
+            if isinstance(self.json, str):
+                return builder.create_survey_element_from_json(self.json)
+            if isinstance(self.json, dict):
+                return builder.create_survey_element_from_dict(self.json)
+        except ValueError:
+            pass
+        except (PyXFormError, KeyError) as e:
+            if (
+                "Arguments 'itemset' and 'list_name' must not both be None or empty"
+                in str(e)
+                or "itemset" in str(e)
+            ) and self.xls:
+                return self.get_survey_from_xlsform()
+            raise
+
+        return bytes(bytearray(self.xml, encoding="utf-8"))
+
     def get_survey(self):
         """Returns an XML XForm survey object."""
         if not hasattr(self, "_survey"):
-            try:
-                builder = SurveyElementBuilder()
-                if isinstance(self.json, str):
-                    self._survey = builder.create_survey_element_from_json(self.json)
-                if isinstance(self.json, dict):
-                    self._survey = builder.create_survey_element_from_dict(self.json)
-            except ValueError:
-                xml = bytes(bytearray(self.xml, encoding="utf-8"))
-                self._survey = create_survey_element_from_xml(xml)
+            self._survey = self._get_survey()
         return self._survey
 
     survey = property(get_survey)
@@ -405,24 +474,23 @@ class XFormMixin:
             field for field in self.get_survey_elements() if field.name == name_or_xpath
         ]
 
-        return fields[0] if fields else None
+        if fields:
+            return fields[0]
 
-    def get_child_elements(self, name_or_xpath, split_select_multiples=True):
+        return None
+
+    def get_child_elements(self, name_or_xpath):
         """Returns a list of survey elements children in a flat list.
-        If the element is a group or multiple select the child elements are
-        appended to the list. If the name_or_xpath is a repeat we iterate
-        through the child elements as well.
+        If the element is a group the child elements are appended to the list.
+        If the name_or_xpath is a repeat we iterate through the child elements.
         """
-        group_and_select_multiples = ["group"]
-        if split_select_multiples:
-            group_and_select_multiples += ["select all that apply"]
 
         def flatten(elem, items=None):
             items = [] if items is None else items
             results = []
             if elem:
-                xpath = elem.get_abbreviated_xpath()
-                if elem.type in group_and_select_multiples or (
+                xpath = get_abbreviated_xpath(elem.get_xpath())
+                if (hasattr(elem, "type") and elem.type == "group") or (
                     xpath == name_or_xpath and elem.type == "repeat"
                 ):
                     for child in elem.children:
@@ -438,7 +506,9 @@ class XFormMixin:
 
     def get_choice_label(self, field, choice_value, lang="English"):
         """Returns a choice's label for the given ``field`` and ``choice_value``."""
-        choices = [choice for choice in field.children if choice.name == choice_value]
+        choices = [
+            choice for choice in field.choices.options if choice.name == choice_value
+        ]
         if choices:
             choice = choices[0]
             label = choice.label
@@ -457,9 +527,9 @@ class XFormMixin:
         """
         names = {}
         for elem in self.get_survey_elements():
-            names[
-                _encode_for_mongo(str(elem.get_abbreviated_xpath()))
-            ] = elem.get_abbreviated_xpath()
+            names[_encode_for_mongo(str(get_abbreviated_xpath(elem.get_xpath())))] = (
+                get_abbreviated_xpath(elem.get_xpath())
+            )
         return names
 
     survey_elements = property(get_survey_elements)
@@ -467,9 +537,9 @@ class XFormMixin:
     def get_field_name_xpaths_only(self):
         """Returns the abbreviated_xpath of all fields in a survey form."""
         return [
-            elem.get_abbreviated_xpath()
+            get_abbreviated_xpath(elem.get_xpath())
             for elem in self.survey_elements
-            if elem.type not in ("", "survey")
+            if hasattr(elem, "type") and elem.type not in ("", "survey")
         ]
 
     def geopoint_xpaths(self):
@@ -477,9 +547,11 @@ class XFormMixin:
         survey_elements = self.get_survey_elements()
 
         return [
-            e.get_abbreviated_xpath()
+            get_abbreviated_xpath(e.get_xpath())
             for e in survey_elements
-            if e.bind.get("type") == "geopoint"
+            if hasattr(e, "bind")
+            and e.bind is not None
+            and e.bind.get("type") == "geopoint"
         ]
 
     def polygon_xpaths(self):
@@ -487,9 +559,11 @@ class XFormMixin:
         survey_elements = self.get_survey_elements()
 
         return [
-            e.get_abbreviated_xpath()
+            get_abbreviated_xpath(e.get_xpath())
             for e in survey_elements
-            if e.bind.get("type") == "geoshape"
+            if hasattr(e, "bind")
+            and e.bind is not None
+            and e.bind.get("type") == "geoshape"
         ]
 
     def geotrace_xpaths(self):
@@ -497,9 +571,11 @@ class XFormMixin:
         survey_elements = self.get_survey_elements()
 
         return [
-            e.get_abbreviated_xpath()
+            get_abbreviated_xpath(e.get_xpath())
             for e in survey_elements
-            if e.bind.get("type") == "geotrace"
+            if hasattr(e, "bind")
+            and e.bind is not None
+            and e.bind.get("type") == "geotrace"
         ]
 
     def xpath_of_first_geopoint(self):
@@ -521,15 +597,20 @@ class XFormMixin:
         result = [] if result is None else result
         path = "/".join([prefix, str(survey_element.name)])
 
-        if survey_element.children is not None:
+        if not isinstance(survey_element, Question) and (
+            hasattr(survey_element, "children") and survey_element.children is not None
+        ):
             # add xpaths to result for each child
             indices = (
                 [""]
                 if not isinstance(survey_element, RepeatingSection)
                 else [f"[{(i + 1)}]" for i in range(repeat_iterations)]
             )
+            children = (
+                survey_element.children if hasattr(survey_element, "children") else []
+            )
             for i in indices:
-                for e in survey_element.children:
+                for e in children:
                     self.xpaths(path + i, e, result, repeat_iterations)
 
         if isinstance(survey_element, Question):
@@ -538,13 +619,20 @@ class XFormMixin:
         # replace the single question column with a column for each
         # item in a select all that apply question.
         if (
-            survey_element.bind.get("type") == "string"
+            hasattr(survey_element, "bind")
+            and hasattr(survey_element, "type")
+            and survey_element.bind is not None
+            and survey_element.bind.get("type") == "string"
             and survey_element.type == MULTIPLE_SELECT_TYPE
         ):
             result.pop()
-            for child in survey_element.children:
+            for child in survey_element.choices.options:
                 result.append("/".join([path, child.name]))
-        elif survey_element.bind.get("type") == "geopoint":
+        elif (
+            hasattr(survey_element, "bind")
+            and survey_element.bind is not None
+            and survey_element.bind.get("type") == "geopoint"
+        ):
             result += self.get_additional_geopoint_xpaths(path)
 
         return result
@@ -613,14 +701,37 @@ class XFormMixin:
         if not hasattr(self, "_survey_elements"):
             self._survey_elements = {}
             for e in self.get_survey_elements():
-                self._survey_elements[e.get_abbreviated_xpath()] = e
+                self._survey_elements[get_abbreviated_xpath(e.get_xpath())] = e
 
         def remove_all_indices(xpath):
             """Removes all indices from an ``xpath``."""
             return re.sub(r"\[\d+\]", "", xpath)
 
         clean_xpath = remove_all_indices(abbreviated_xpath)
-        return self._survey_elements.get(clean_xpath)
+        element = self._survey_elements.get(clean_xpath)
+        if element is None:
+            # might be choices
+            parts = abbreviated_xpath.split("/")
+            parent_xpath = "/".join(parts[:-1])
+            choice_name = parts[-1]
+            parent = self.get_element(parent_xpath)
+            if (
+                parent
+                and hasattr(parent, "type")
+                and parent.type == MULTIPLE_SELECT_TYPE
+                and parent.choices is not None
+            ):
+                choices = [
+                    choice
+                    for choice in parent.choices.options
+                    if choice.name == choice_name
+                ]
+                if choices:
+                    element = choices[0]
+                    self._survey_elements[
+                        get_abbreviated_xpath(parent.get_xpath() + element.get_xpath())
+                    ] = element
+        return element
 
     def get_default_language(self):
         """Returns the default language"""
@@ -662,7 +773,9 @@ class XFormMixin:
     def get_xpath_cmp(self):
         """Compare two xpaths"""
         if not hasattr(self, "_xpaths"):
-            self._xpaths = [e.get_abbreviated_xpath() for e in self.survey_elements]
+            self._xpaths = [
+                get_abbreviated_xpath(e.get_xpath()) for e in self.survey_elements
+            ]
 
         # pylint: disable=invalid-name
         def xpath_cmp(x, y):
@@ -748,7 +861,11 @@ class XFormMixin:
 
     def get_survey_elements_of_type(self, element_type):
         """Returns all survey elements of type ``element_type``."""
-        return [e for e in self.get_survey_elements() if e.type == element_type]
+        return [
+            e
+            for e in self.get_survey_elements()
+            if hasattr(e, "type") and e.type == element_type
+        ]
 
     # pylint: disable=invalid-name
     def get_survey_elements_with_choices(self):
@@ -757,7 +874,9 @@ class XFormMixin:
             choices_type = [constants.SELECT_ONE, constants.SELECT_ALL_THAT_APPLY]
 
             self._survey_elements_with_choices = [
-                e for e in self.get_survey_elements() if e.type in choices_type
+                e
+                for e in self.get_survey_elements()
+                if hasattr(e, "type") and e.type in choices_type
             ]
 
         return self._survey_elements_with_choices
@@ -768,7 +887,7 @@ class XFormMixin:
         """
         if not hasattr(self, "_select_one_xpaths"):
             self._select_one_xpaths = [
-                e.get_abbreviated_xpath()
+                get_abbreviated_xpath(e.get_xpath())
                 for e in sum(
                     [
                         self.get_survey_elements_of_type(select)
@@ -787,7 +906,7 @@ class XFormMixin:
         """
         if not hasattr(self, "_select_multiple_xpaths"):
             self._select_multiple_xpaths = [
-                e.get_abbreviated_xpath()
+                get_abbreviated_xpath(e.get_xpath())
                 for e in sum(
                     [
                         self.get_survey_elements_of_type(select)
@@ -802,7 +921,7 @@ class XFormMixin:
     def get_media_survey_xpaths(self):
         """Returns all survey element abbreviated_xpath of type in KNOWN_MEDIA_TYPES"""
         return [
-            e.get_abbreviated_xpath()
+            get_abbreviated_xpath(e.get_xpath())
             for e in sum(
                 [self.get_survey_elements_of_type(m) for m in KNOWN_MEDIA_TYPES], []
             )
@@ -813,7 +932,7 @@ class XFormMixin:
         Returns abbreviated_xpath for OSM question types in the survey.
         """
         return [
-            elem.get_abbreviated_xpath()
+            get_abbreviated_xpath(elem.get_xpath())
             for elem in self.get_survey_elements_of_type("osm")
         ]
 
@@ -893,7 +1012,7 @@ class XForm(XFormMixin, BaseModel):
     )
     # XForm was created as a merged dataset
     is_merged_dataset = models.BooleanField(default=False)
-
+    is_instance_json_regenerated = models.BooleanField(default=False)
     tags = TaggableManager()
 
     class Meta:
@@ -904,7 +1023,6 @@ class XForm(XFormMixin, BaseModel):
         )
         verbose_name = gettext_lazy("XForm")
         verbose_name_plural = gettext_lazy("XForms")
-        ordering = ("pk",)
         permissions = (
             ("view_xform_all", _("Can view all associated data")),
             ("view_xform_data", _("Can view submitted data")),
@@ -914,6 +1032,12 @@ class XForm(XFormMixin, BaseModel):
             ("can_export_xform_data", _("Can export form data")),
             ("delete_submission", _("Can delete submissions from form")),
         )
+        indexes = [
+            models.Index(
+                fields=["deleted_at"],
+                name="idx_logger_xform_deleted_at",
+            )
+        ]
 
     def file_name(self):
         """Returns the XML filename based on the ``self.id_string``."""
@@ -1097,6 +1221,9 @@ class XForm(XFormMixin, BaseModel):
         without violating the uniqueness constraint.
         Also soft deletes associated dataviews
         """
+        if self.deleted_at is not None:
+            return
+
         soft_deletion_time = timezone.now()
         deletion_suffix = soft_deletion_time.strftime("-deleted-at-%s")
         self.deleted_at = soft_deletion_time
@@ -1131,6 +1258,38 @@ class XForm(XFormMixin, BaseModel):
             metadata.soft_delete()
         clear_project_cache(self.project_id)
 
+    @transaction.atomic()
+    def restore(self):
+        """Restore a soft-deleted XForm"""
+        if self.deleted_at is None:
+            return
+
+        self.deleted_at = None
+        self.id_string = self.id_string.split("-deleted-at-")[0]
+        self.sms_id_string = self.sms_id_string.split("-deleted-at-")[0]
+        self.downloadable = True
+        self.deleted_by = None
+        self.save(
+            update_fields=[
+                "deleted_at",
+                "id_string",
+                "sms_id_string",
+                "downloadable",
+                "deleted_by",
+            ]
+        )
+        # Restore associated filtered datasets
+        for dataview in self.dataview_set.all():
+            dataview.restore()
+        # Restore associated Merged-Datasets
+        for merged_dataset in self.mergedxform_ptr.filter(deleted_at__isnull=False):
+            merged_dataset.restore()
+        # Restore associated Form Media Files
+        for metadata in self.metadata_set.filter(deleted_at__isnull=False):
+            metadata.restore()
+
+        clear_project_cache(self.project_id)
+
     def submission_count(self, force_update=False):
         """Returns the form's number of submission."""
         if self.num_of_submissions == 0 or force_update:
@@ -1159,12 +1318,7 @@ class XForm(XFormMixin, BaseModel):
     @property
     def submission_count_for_today(self):
         """Returns the submissions count for the current day."""
-        current_timzone_name = timezone.get_current_timezone_name()
-        current_timezone = pytz.timezone(current_timzone_name)
-        today = datetime.today()
-        current_date = current_timezone.localize(
-            datetime(today.year, today.month, today.day)
-        ).isoformat()
+        current_date = timezone.localdate().isoformat()
         count = (
             cache.get(f"{XFORM_SUBMISSION_COUNT_FOR_DAY}{self.id}")
             if cache.get(f"{XFORM_SUBMISSION_COUNT_FOR_DAY_DATE}{self.id}")

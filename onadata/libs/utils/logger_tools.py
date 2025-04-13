@@ -1,34 +1,44 @@
 # -*- coding: utf-8 -*-
+# pylint: disable=too-many-lines
 """
 logger_tools - Logger app utility functions.
 """
+
+import importlib
 import json
+import logging
 import os
 import re
 import sys
 import tempfile
 from builtins import str as text
-from datetime import datetime
+from collections import OrderedDict
+from datetime import datetime, timedelta
+from datetime import timezone as tz
 from hashlib import sha256
 from http.client import BadStatusLine
-from typing import NoReturn
+from typing import Any
 from wsgiref.util import FileWrapper
 from xml.dom import Node
 from xml.parsers.expat import ExpatError
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.contenttypes.models import ContentType
+from django.core.cache import cache
 from django.core.exceptions import (
     MultipleObjectsReturned,
     PermissionDenied,
     ValidationError,
 )
-from django.core.files.storage import get_storage_class
+from django.core.files.storage import storages
 from django.db import DataError, IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import F, Q
+from django.db.models.query import QuerySet
 from django.http import (
     HttpResponse,
     HttpResponseNotFound,
+    HttpResponseRedirect,
     StreamingHttpResponse,
     UnreadablePostError,
 )
@@ -37,7 +47,8 @@ from django.utils import timezone
 from django.utils.encoding import DjangoUnicodeDecodeError
 from django.utils.translation import gettext as _
 
-import pytz
+import boto3
+from botocore.client import Config
 from defusedxml.ElementTree import ParseError, fromstring
 from dict2xml import dict2xml
 from modilabs.utils.subprocess_timeout import ProcessTimedOut
@@ -47,7 +58,15 @@ from pyxform.validators.odk_validate import ODKValidateError
 from pyxform.xform2json import create_survey_element_from_xml
 from rest_framework.response import Response
 
-from onadata.apps.logger.models import Attachment, Instance, XForm, XFormVersion
+from onadata.apps.logger.models import (
+    Attachment,
+    Instance,
+    RegistrationForm,
+    XForm,
+    XFormVersion,
+)
+from onadata.apps.logger.models.entity import Entity
+from onadata.apps.logger.models.entity_list import EntityList
 from onadata.apps.logger.models.instance import (
     FormInactiveError,
     FormIsMergedDatasetError,
@@ -66,11 +85,15 @@ from onadata.apps.logger.xform_instance_parser import (
     NonUniqueFormIdError,
     clean_and_parse_xml,
     get_deprecated_uuid_from_xml,
+    get_entity_uuid_from_xml,
+    get_meta_from_xml,
     get_submission_date_from_xml,
     get_uuid_from_xml,
 )
+from onadata.apps.main.models.meta_data import MetaData
 from onadata.apps.messaging.constants import (
     SUBMISSION_CREATED,
+    SUBMISSION_DELETED,
     SUBMISSION_EDITED,
     XFORM,
 )
@@ -79,9 +102,19 @@ from onadata.apps.viewer.models.data_dictionary import DataDictionary
 from onadata.apps.viewer.models.parsed_instance import ParsedInstance
 from onadata.apps.viewer.signals import process_submission
 from onadata.libs.utils.analytics import TrackObjectEvent
-from onadata.libs.utils.common_tags import METADATA_FIELDS
+from onadata.libs.utils.cache_tools import (
+    ELIST_FAILOVER_REPORT_SENT,
+    ELIST_NUM_ENTITIES,
+    ELIST_NUM_ENTITIES_CREATED_AT,
+    ELIST_NUM_ENTITIES_IDS,
+    ELIST_NUM_ENTITIES_LOCK,
+    XFORM_SUBMISSIONS_DELETING,
+    safe_delete,
+    set_cache_with_lock,
+)
+from onadata.libs.utils.common_tags import EXPORT_COLUMNS_REGISTER, METADATA_FIELDS
 from onadata.libs.utils.common_tools import get_uuid, report_exception
-from onadata.libs.utils.model_tools import set_uuid
+from onadata.libs.utils.model_tools import queryset_iterator, set_uuid
 from onadata.libs.utils.user_auth import get_user_default_project
 
 OPEN_ROSA_VERSION_HEADER = "X-OpenRosa-Version"
@@ -100,6 +133,8 @@ uuid_regex = re.compile(
     r"<formhub>\s*<uuid>\s*([^<]+)\s*</uuid>\s*</formhub>", re.DOTALL
 )
 
+logger = logging.getLogger(__name__)
+
 
 # pylint: disable=invalid-name
 User = get_user_model()
@@ -115,9 +150,11 @@ def create_xform_version(xform: XForm, user: User) -> XFormVersion:
             versioned_xform = XFormVersion.objects.create(
                 xform=xform,
                 xls=xform.xls,
-                json=xform.json
-                if isinstance(xform.json, str)
-                else json.dumps(xform.json),
+                json=(
+                    xform.json
+                    if isinstance(xform.json, str)
+                    else json.dumps(xform.json)
+                ),
                 version=xform.version,
                 created_by=user,
                 xml=xform.xml,
@@ -127,7 +164,7 @@ def create_xform_version(xform: XForm, user: User) -> XFormVersion:
     return versioned_xform
 
 
-# pylint: disable=too-many-arguments
+# pylint: disable=too-many-arguments, too-many-positional-arguments
 def _get_instance(xml, new_uuid, submitted_by, status, xform, checksum, request=None):
     history = None
     instance = None
@@ -360,7 +397,7 @@ def check_submission_permissions(request, xform):
         )
 
 
-def check_submission_encryption(xform: XForm, xml: bytes) -> NoReturn:
+def is_valid_encrypted_submission(xform_is_encrypted: bool, xml: bytes) -> bool:
     """
     Check that the submission is encrypted or unencrypted depending on the
     encryption status of an XForm.
@@ -382,14 +419,11 @@ def check_submission_encryption(xform: XForm, xml: bytes) -> NoReturn:
     if encrypted_attrib == "yes" or encryption_elems_num > 1:
         if (
             not encryption_elems_num == 2 or not encrypted_attrib == "yes"
-        ) and xform.encrypted:
+        ) and xform_is_encrypted:
             raise InstanceFormatError(_("Encrypted submission incorrectly formatted."))
         submission_encrypted = True
 
-    if xform.encrypted and not submission_encrypted:
-        raise InstanceEncryptionError(
-            _("Unencrypted submissions are not allowed for encrypted forms.")
-        )
+    return submission_encrypted
 
 
 def update_attachment_tracking(instance):
@@ -422,17 +456,21 @@ def save_attachments(xform, instance, media_files, remove_deleted_media=False):
         if len(filename) > 100:
             raise AttachmentNameError(filename)
         media_in_submission = filename in instance.get_expected_media() or [
-            instance.xml.decode("utf-8").find(filename) != -1
-            if isinstance(instance.xml, bytes)
-            else instance.xml.find(filename) != -1
+            (
+                instance.xml.decode("utf-8").find(filename) != -1
+                if isinstance(instance.xml, bytes)
+                else instance.xml.find(filename) != -1
+            )
         ]
         if media_in_submission:
             Attachment.objects.get_or_create(
+                xform=xform,
                 instance=instance,
                 media_file=f,
                 mimetype=content_type,
                 name=filename,
                 extension=extension,
+                user=instance.user,
             )
     if remove_deleted_media:
         instance.soft_delete_attachments()
@@ -464,9 +502,7 @@ def save_submission(
     if date_created_override:
         if not timezone.is_aware(date_created_override):
             # default to utc?
-            date_created_override = timezone.make_aware(
-                date_created_override, timezone.utc
-            )
+            date_created_override = timezone.make_aware(date_created_override, tz.utc)
         instance.date_created = date_created_override
         instance.save()
 
@@ -513,7 +549,12 @@ def create_instance(
     xml = xml_file.read()
     xform = get_xform_from_submission(xml, username, uuid, request=request)
     check_submission_permissions(request, xform)
-    check_submission_encryption(xform, xml)
+    submission_encrypted = is_valid_encrypted_submission(xform.encrypted, xml)
+    if xform.encrypted and not submission_encrypted:
+        raise InstanceEncryptionError(
+            _("Unencrypted submissions are not allowed for encrypted forms.")
+        )
+
     checksum = sha256(xml).hexdigest()
 
     new_uuid = get_uuid_from_xml(xml)
@@ -672,6 +713,109 @@ def safe_create_instance(  # noqa C901
     return [error, instance]
 
 
+def generate_aws_media_url(
+    file_path: str, content_disposition: str, expiration: int = 3600
+):
+    """Generate S3 URL."""
+    s3_class = storages.create_storage(
+        {"BACKEND": "storages.backends.s3boto3.S3Boto3Storage"}
+    )
+    bucket_name = s3_class.bucket.name
+    aws_endpoint_url = getattr(settings, "AWS_S3_ENDPOINT_URL", None)
+    s3_config = Config(
+        signature_version=getattr(settings, "AWS_S3_SIGNATURE_VERSION", "s3v4"),
+        region_name=getattr(settings, "AWS_S3_REGION_NAME", None),
+    )
+    s3_client = boto3.client(
+        "s3",
+        config=s3_config,
+        endpoint_url=aws_endpoint_url,
+        aws_access_key_id=s3_class.access_key,
+        aws_secret_access_key=s3_class.secret_key,
+    )
+
+    # Generate a presigned URL for the S3 object
+    return s3_client.generate_presigned_url(
+        "get_object",
+        Params={
+            "Bucket": bucket_name,
+            "Key": file_path,
+            "ResponseContentDisposition": content_disposition,
+            "ResponseContentType": "application/octet-stream",
+        },
+        ExpiresIn=expiration,
+    )
+
+
+def generate_media_url_with_sas(file_path: str, expiration: int = 3600):
+    """
+    Generate Azure storage URL.
+    """
+    # pylint: disable=import-outside-toplevel
+    from azure.storage.blob import AccountSasPermissions, generate_blob_sas
+
+    account_name = getattr(settings, "AZURE_ACCOUNT_NAME", "")
+    container_name = getattr(settings, "AZURE_CONTAINER", "")
+    media_url = (
+        f"https://{account_name}.blob.core.windows.net/{container_name}/{file_path}"
+    )
+    sas_token = generate_blob_sas(
+        account_name=account_name,
+        account_key=getattr(settings, "AZURE_ACCOUNT_KEY", ""),
+        container_name=container_name,
+        blob_name=file_path,
+        permission=AccountSasPermissions(read=True),
+        expiry=timezone.now() + timedelta(seconds=expiration),
+    )
+    return f"{media_url}?{sas_token}"
+
+
+def get_storages_media_download_url(
+    file_path: str, content_disposition: str, expires_in=3600
+) -> str | None:
+    """Get the media download URL for the storages backend.
+
+    :param file_path: The path to the media file.
+    :param content_disposition: The content disposition header.
+    :param expires_in: The expiration time in seconds.
+    :returns: The media download URL.
+    """
+    s3_class = None
+    azure_class = None
+    default_storage = storages["default"]
+    url = None
+
+    try:
+        s3_class = storages.create_storage(
+            {"BACKEND": "storages.backends.s3boto3.S3Boto3Storage"}
+        )
+    except ModuleNotFoundError:
+        pass
+
+    try:
+        azure_class = storages.create_storage(
+            {"BACKEND": "storages.backends.azure_storage.AzureStorage"}
+        )
+    except ModuleNotFoundError:
+        pass
+
+    # Check if the storage backend is S3
+    if isinstance(default_storage, type(s3_class)):
+        try:
+            url = generate_aws_media_url(file_path, content_disposition, expires_in)
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            logging.exception(error)
+
+    # Check if the storage backend is Azure
+    elif isinstance(default_storage, type(azure_class)):
+        try:
+            url = generate_media_url_with_sas(file_path, expires_in)
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            logging.error(error)
+
+    return url
+
+
 def response_with_mimetype_and_name(
     mimetype,
     name,
@@ -680,33 +824,54 @@ def response_with_mimetype_and_name(
     file_path=None,
     use_local_filesystem=False,
     full_mime=False,
+    expires_in=3600,
 ):
     """Returns a HttpResponse with Content-Disposition header set
 
     Triggers a download on the browser."""
     if extension is None:
         extension = mimetype
+
     if not full_mime:
         mimetype = f"application/{mimetype}"
+
+    content_disposition = generate_content_disposition_header(
+        name, extension, show_date
+    )
+    not_found_response = HttpResponseNotFound(
+        _("The requested file could not be found.")
+    )
+
     if file_path:
-        try:
-            if not use_local_filesystem:
-                default_storage = get_storage_class()()
+        if not use_local_filesystem:
+            download_url = get_storages_media_download_url(
+                file_path, content_disposition, expires_in
+            )
+            if download_url is not None:
+                return HttpResponseRedirect(download_url)
+
+            try:
+                default_storage = storages["default"]
                 wrapper = FileWrapper(default_storage.open(file_path))
                 response = StreamingHttpResponse(wrapper, content_type=mimetype)
                 response["Content-Length"] = default_storage.size(file_path)
-            else:
+
+            except IOError as error:
+                logging.exception(error)
+                response = not_found_response
+
+        else:
+            try:
                 # pylint: disable=consider-using-with
                 wrapper = FileWrapper(open(file_path, "rb"))
                 response = StreamingHttpResponse(wrapper, content_type=mimetype)
                 response["Content-Length"] = os.path.getsize(file_path)
-        except IOError:
-            response = HttpResponseNotFound(_("The requested file could not be found."))
+            except IOError as error:
+                logging.exception(error)
+                response = not_found_response
     else:
         response = HttpResponse(content_type=mimetype)
-    response["Content-Disposition"] = generate_content_disposition_header(
-        name, extension, show_date
-    )
+    response["Content-Disposition"] = content_disposition
     return response
 
 
@@ -717,7 +882,11 @@ def generate_content_disposition_header(name, extension, show_date=True):
     if show_date:
         timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
         name = f"{name}-{timestamp}"
-    return f"attachment; filename={name}.{extension}"
+    # The filename is enclosed in quotes because it ensures that special characters,
+    # spaces, or punctuation in the filename are correctly interpreted by browsers
+    # and clients. This is particularly important for filenames that may contain
+    # spaces or non-ASCII characters.
+    return f'attachment; filename="{name}.{extension}"'
 
 
 def store_temp_file(data):
@@ -842,8 +1011,7 @@ def set_default_openrosa_headers(response):
     """Sets the default OpenRosa headers into a ``response`` object."""
     response["Content-Type"] = "text/html; charset=utf-8"
     response["X-OpenRosa-Accept-Content-Length"] = DEFAULT_CONTENT_LENGTH
-    tz = pytz.timezone(settings.TIME_ZONE)
-    dt = datetime.now(tz).strftime("%a, %d %b %Y %H:%M:%S %Z")
+    dt = timezone.localtime().strftime("%a, %d %b %Y %H:%M:%S %Z")
     response["Date"] = dt
     response[OPEN_ROSA_VERSION_HEADER] = OPEN_ROSA_VERSION
     response["Content-Type"] = DEFAULT_CONTENT_TYPE
@@ -910,6 +1078,7 @@ class OpenRosaNotAuthenticated(Response):
 
 
 def inject_instanceid(xml_str, uuid):
+    """Adds the `uuid` as the <instanceID/> to an XML string `xml_str`."""
     if get_uuid_from_xml(xml_str) is None:
         xml = clean_and_parse_xml(xml_str)
         children = xml.childNodes
@@ -947,13 +1116,7 @@ def inject_instanceid(xml_str, uuid):
     return xml_str
 
 
-def remove_xform(xform):
-    """Deletes an XForm ``xform``."""
-    # delete xform, and all related models
-    xform.delete()
-
-
-class PublishXForm:
+class PublishXForm:  # pylint: disable=too-few-public-methods
     "A class to publish an XML XForm file."
 
     def __init__(self, xml_file, user):
@@ -964,3 +1127,506 @@ class PublishXForm:
     def publish_xform(self):
         """Publish an XForm XML file."""
         return publish_xml_form(self.xml_file, self.user, self.project)
+
+
+def get_entity_json_from_instance(
+    instance: Instance, registration_form: RegistrationForm
+) -> dict:
+    """Parses Instance json and returns Entity json
+
+    Args:
+        instance (Instance): Submission to create Entity
+
+    Returns:
+        dict: Entity properties
+    """
+    instance_json: dict[str, Any] = instance.get_dict()
+    # Getting a mapping of save_to field to the field name
+    mapped_properties = registration_form.get_save_to(instance.version)
+    # Field names with an alias defined
+    property_fields = list(mapped_properties.values())
+
+    def get_field_alias(field_name: str) -> str:
+        """Get the alias (save_to value) of a form field"""
+        for alias, field in mapped_properties.items():
+            if field == field_name:
+                return alias
+
+        return field_name
+
+    def parse_instance_json(data: dict[str, Any]) -> None:
+        """Parse the original json, replacing field names with their alias
+
+        The data keys are modified in place
+        """
+        for field_name in list(data):
+            field_data = data[field_name]
+            del data[field_name]
+
+            if field_name.startswith("formhub"):
+                continue
+
+            if field_name.startswith("meta"):
+                if field_name == "meta/entity/label":
+                    data["label"] = field_data
+
+                continue
+
+            # We extract field names within grouped sections
+            ungrouped_field_name = field_name.split("/")[-1]
+
+            if ungrouped_field_name in property_fields:
+                field_alias = get_field_alias(ungrouped_field_name)
+                data[field_alias] = field_data
+
+    parse_instance_json(instance_json)
+
+    return instance_json
+
+
+def create_entity_from_instance(
+    instance: Instance, registration_form: RegistrationForm
+) -> Entity:
+    """Create an Entity
+
+    Args:
+        instance (Instance): Submission from which the Entity is created from
+        registration_form (RegistrationForm): RegistrationForm creating the
+        Entity
+
+    Returns:
+        Entity: A newly created Entity
+    """
+    entity_json = get_entity_json_from_instance(instance, registration_form)
+    entity_list = registration_form.entity_list
+    entity = Entity.objects.create(
+        entity_list=entity_list,
+        json=entity_json,
+        uuid=get_entity_uuid_from_xml(instance.xml),
+    )
+    entity.history.create(
+        registration_form=registration_form,
+        xml=instance.xml,
+        instance=instance,
+        form_version=instance.version,
+        json=entity_json,
+        created_by=instance.user,
+    )
+
+    return entity
+
+
+def update_entity_from_instance(
+    uuid: str, instance: Instance, registration_form: RegistrationForm
+) -> Entity | None:
+    """Updates Entity
+
+    Args:
+        uuid (str): uuid of the Entity to be updated
+        instance (Instance): Submission that updates an Entity
+
+    Returns:
+        Entity | None: updated Entity if uuid valid, else None
+    """
+    try:
+        entity = Entity.objects.get(uuid=uuid)
+
+    except Entity.DoesNotExist as err:
+        logger.exception(err)
+        return None
+
+    patch_data = get_entity_json_from_instance(instance, registration_form)
+    entity.json = {**entity.json, **patch_data}
+    entity.save()
+    entity.history.create(
+        registration_form=registration_form,
+        xml=instance.xml,
+        instance=instance,
+        form_version=instance.version,
+        json=entity.json,
+        created_by=instance.user,
+    )
+
+    return entity
+
+
+def soft_delete_entities_bulk(entity_qs: QuerySet[Entity], deleted_by=None) -> None:
+    """Soft delete Entities in bulk
+
+    Args:
+        entity_qs QuerySet(Entity): Entity queryset
+        deleted_by (User): User initiating the delete
+    """
+    for entity in queryset_iterator(entity_qs):
+        entity.soft_delete(deleted_by)
+
+
+def create_or_update_entity_from_instance(instance: Instance) -> None:
+    """Create or Update Entity from Instance
+
+    Args:
+        instance (Instance): Instance to create/update Entity from
+    """
+    registration_form_qs = RegistrationForm.objects.filter(
+        xform=instance.xform, is_active=True
+    )
+    entity_node = get_meta_from_xml(instance.xml, "entity")
+
+    if not registration_form_qs.exists() or not entity_node:
+        return
+
+    registration_form = registration_form_qs.first()
+    mutation_success_checks = ["1", "true"]
+    entity_uuid = entity_node.getAttribute("id")
+    exists = False
+
+    if entity_uuid is not None:
+        exists = Entity.objects.filter(uuid=entity_uuid).exists()
+
+    if exists and entity_node.getAttribute("update") in mutation_success_checks:
+        # Update Entity
+        update_entity_from_instance(entity_uuid, instance, registration_form)
+
+    elif not exists and entity_node.getAttribute("create") in mutation_success_checks:
+        # Create Entity
+        create_entity_from_instance(instance, registration_form)
+
+
+def _inc_elist_num_entities_db(pk: int, count=1) -> None:
+    """Increment EntityList `num_entities` counter in the database
+
+    Args:
+        pk (int): Primary key for EntityList
+        count (int): Value to increase by
+    """
+    # Using Queryset.update ensures we do not call the model's save method and
+    # signals
+    EntityList.objects.filter(pk=pk).update(num_entities=F("num_entities") + count)
+
+
+def _dec_elist_num_entities_db(pk: int, count=1) -> None:
+    """Decrement EntityList `num_entities` counter in the database
+
+    Args:
+        pk (int): Primary key for EntityList
+        count (int): Value to decrease by
+    """
+    # Using Queryset.update ensures we do not call the model's save method and
+    # signals
+    EntityList.objects.filter(pk=pk).update(num_entities=F("num_entities") - count)
+
+
+def _inc_elist_num_entities_cache(pk: int) -> None:
+    """Increment EntityList `num_entities` counter in cache
+
+    Args:
+        pk (int): Primary key for EntityList
+    """
+    counter_cache_key = f"{ELIST_NUM_ENTITIES}{pk}"
+    # Cache timeout is None (no expiry). A background task should be run
+    # periodically to persist the cached counters to the db
+    # and delete the cache. If we were to set a timeout, the cache could
+    # expire before the next periodic run and data will be lost.
+    counter_cache_ttl = None
+    counter_cache_created = cache.add(counter_cache_key, 1, counter_cache_ttl)
+
+    def add_to_cached_ids(current_ids: set | None):
+        if current_ids is None:
+            current_ids = set()
+
+        if pk not in current_ids:
+            current_ids.add(pk)
+
+        return current_ids
+
+    set_cache_with_lock(ELIST_NUM_ENTITIES_IDS, add_to_cached_ids, counter_cache_ttl)
+    cache.add(ELIST_NUM_ENTITIES_CREATED_AT, timezone.now(), counter_cache_ttl)
+
+    if not counter_cache_created:
+        cache.incr(counter_cache_key)
+
+
+def _dec_elist_num_entities_cache(pk: int) -> None:
+    """Decrement EntityList `num_entities` counter in cache
+
+    Args:
+        pk (int): Primary key for EntityList
+    """
+    counter_cache_key = f"{ELIST_NUM_ENTITIES}{pk}"
+
+    if cache.get(counter_cache_key) is not None:
+        cache.decr(counter_cache_key)
+
+
+def inc_elist_num_entities(pk: int) -> None:
+    """Increment EntityList `num_entities` counter
+
+    Updates cached counter if cache is not locked. Else, the database
+    counter is updated
+
+    Args:
+        pk (int): Primary key for EntityList
+    """
+
+    if _is_elist_num_entities_cache_locked():
+        _inc_elist_num_entities_db(pk)
+
+    else:
+        try:
+            _inc_elist_num_entities_cache(pk)
+            _exec_cached_elist_counter_commit_failover()
+
+        except ConnectionError as exc:
+            logger.exception(exc)
+            # Fallback to db if cache inacessible
+            _inc_elist_num_entities_db(pk)
+
+
+def dec_elist_num_entities(pk: int) -> None:
+    """Decrement EntityList `num_entities` counter
+
+    Updates cached counter if cache is not locked. Else, the database
+    counter is updated.
+
+    Args:
+        pk (int): Primary key for EntityList
+    """
+    counter_cache_key = f"{ELIST_NUM_ENTITIES}{pk}"
+
+    if _is_elist_num_entities_cache_locked() or cache.get(counter_cache_key) is None:
+        _dec_elist_num_entities_db(pk)
+
+    else:
+        try:
+            _dec_elist_num_entities_cache(pk)
+
+        except ConnectionError as exc:
+            logger.exception(exc)
+            # Fallback to db if cache inacessible
+            _dec_elist_num_entities_db(pk)
+
+
+def _is_elist_num_entities_cache_locked() -> bool:
+    """Checks if EntityList `num_entities` cached counter is locked
+
+    Typically, the cache is locked if the cached data is in the process
+    of being persisted in the database.
+
+    The cache is locked to ensure no further updates are made when the
+    data is being committed to the database.
+
+    Returns True, if cache is locked, False otherwise
+    """
+
+    return cache.get(ELIST_NUM_ENTITIES_LOCK) is not None
+
+
+def commit_cached_elist_num_entities() -> None:
+    """Commit cached EntityList `num_entities` counter to the database
+
+    Commit is successful if no other process holds the lock
+    """
+    lock_acquired = cache.add(ELIST_NUM_ENTITIES_LOCK, "true", 7200)
+
+    if lock_acquired:
+        entity_list_pks: set[int] = cache.get(ELIST_NUM_ENTITIES_IDS, set())
+
+        for pk in entity_list_pks:
+            counter_key = f"{ELIST_NUM_ENTITIES}{pk}"
+            counter: int = cache.get(counter_key, 0)
+
+            if counter:
+                _inc_elist_num_entities_db(pk, counter)
+
+            safe_delete(counter_key)
+
+        safe_delete(ELIST_NUM_ENTITIES_IDS)
+        safe_delete(ELIST_NUM_ENTITIES_LOCK)
+        safe_delete(ELIST_NUM_ENTITIES_CREATED_AT)
+
+
+def _exec_cached_elist_counter_commit_failover() -> None:
+    """Check the time lapse since the cached EntityList `num_entities`
+    counters were created and commit if the time lapse exceeds
+    the threshold allowed.
+
+    Acts as a failover incase the cron job responsible for committing
+    the cached data fails or is not configured
+    """
+    cache_created_at: datetime | None = cache.get(ELIST_NUM_ENTITIES_CREATED_AT)
+
+    if cache_created_at is None:
+        return
+
+    # If the time lapse is > ELIST_COUNTER_COMMIT_FAILOVER_TIMEOUT, run the failover
+    failover_timeout: int = getattr(
+        settings, "ELIST_COUNTER_COMMIT_FAILOVER_TIMEOUT", 7200
+    )
+    time_lapse = timezone.now() - cache_created_at
+
+    if time_lapse.total_seconds() > failover_timeout:
+        commit_cached_elist_num_entities()
+        # Do not send report exception if already sent within the past 24 hrs
+        if cache.get(ELIST_FAILOVER_REPORT_SENT) is None:
+            subject = "Periodic task not running"
+            task_name = (
+                "onadata.apps.logger.tasks.commit_cached_elist_num_entities_async"
+            )
+            msg = (
+                f"The failover has been executed because task {task_name} "
+                "is not configured or has malfunctioned"
+            )
+            report_exception(subject, msg)
+            cache.set(ELIST_FAILOVER_REPORT_SENT, "sent", 86400)
+
+
+def delete_xform_submissions(
+    xform: XForm,
+    deleted_by: User,
+    instance_ids: list[int] | None = None,
+    soft_delete: bool = True,
+) -> None:
+    """ "Delete subset or all submissions of an XForm
+
+    :param xform: XForm object
+    :param deleted_by: User initiating the delete
+    :param instance_ids: List of instance ids to delete, None to delete all
+    :param soft_delete: Flag to soft delete or hard delete
+    :return: None
+    """
+    if not soft_delete and not getattr(
+        settings, "ENABLE_SUBMISSION_PERMANENT_DELETE", False
+    ):
+        raise PermissionDenied("Hard delete is not enabled")
+
+    instance_qs = xform.instances.filter(deleted_at__isnull=True)
+
+    if instance_ids:
+        instance_qs = instance_qs.filter(id__in=instance_ids)
+
+    if soft_delete:
+        now = timezone.now()
+        instance_qs.update(deleted_at=now, date_modified=now, deleted_by=deleted_by)
+    else:
+        # Hard delete
+        instance_qs.delete()
+
+    if instance_ids is None:
+        # Every submission has been deleted
+        xform.num_of_submissions = 0
+        xform.save(update_fields=["num_of_submissions"])
+
+    else:
+        xform.submission_count(force_update=True)
+
+    xform.project.date_modified = timezone.now()
+    xform.project.save(update_fields=["date_modified"])
+    safe_delete(f"{XFORM_SUBMISSIONS_DELETING}{xform.pk}")
+    send_message(
+        instance_id=instance_ids,
+        target_id=xform.id,
+        target_type=XFORM,
+        user=deleted_by,
+        message_verb=SUBMISSION_DELETED,
+    )
+
+
+def _register_instance_repeat_columns(instance: Instance, register: MetaData) -> None:
+    """Add Instance repeat columns to the export columns register
+
+    :param instance: Instance object
+    :param metadata: MetaData object that stores the export repeat register
+    """
+    # Avoid cyclic import by using importlib
+    csv_builder_module = importlib.import_module("onadata.libs.utils.csv_builder")
+
+    with transaction.atomic():
+        # We use select_for_update to acquire a row-level lock
+        # Only one process updates it at a time. This prevents race conditions
+        # and updates extra_data atomically
+        register = MetaData.objects.select_for_update().get(pk=register.pk)
+        merged_multiples = json.loads(
+            register.extra_data["merged_multiples"], object_pairs_hook=OrderedDict
+        )
+        split_multiples = json.loads(
+            register.extra_data["split_multiples"], object_pairs_hook=OrderedDict
+        )
+        xform = instance.xform
+        csv_builder_module = csv_builder_module.CSVDataFrameBuilder(
+            xform=xform, username=xform.user.username, id_string=xform.id_string
+        )
+        data = instance.get_full_dict()
+        changes = {
+            "merged_multiples": merged_multiples,
+            "split_multiples": split_multiples,
+        }
+
+        for key, value in data.items():
+            # Reindex split multiples
+            # pylint: disable=protected-access
+            csv_builder_module._reindex(
+                key,
+                value,
+                changes["split_multiples"],
+                data,
+                xform,
+                include_images=[],
+                split_select_multiples=True,
+            )
+            # Reindex merged multiples
+            # pylint: disable=protected-access
+            csv_builder_module._reindex(
+                key,
+                value,
+                changes["merged_multiples"],
+                data,
+                xform,
+                include_images=[],
+                split_select_multiples=False,
+            )
+
+        register.extra_data = {key: json.dumps(value) for key, value in changes.items()}
+        register.save()
+
+
+@transaction.atomic()
+def register_instance_repeat_columns(instance: Instance) -> None:
+    """Add an Instance repeat columns to the export columns register
+
+    :param instance: Instance object
+    """
+    content_type = ContentType.objects.get_for_model(instance.xform)
+
+    try:
+        register = MetaData.objects.get(
+            content_type=content_type,
+            object_id=instance.xform.pk,
+            data_type=EXPORT_COLUMNS_REGISTER,
+        )
+
+    except MetaData.DoesNotExist:
+        return
+
+    _register_instance_repeat_columns(instance, register)
+
+
+@transaction.atomic()
+def reconstruct_xform_export_register(xform: XForm) -> None:
+    """Reconstruct the export columns register for an XForm
+
+    :param xform: XForm object
+    """
+    try:
+        register = MetaData.objects.get(
+            content_type=ContentType.objects.get_for_model(xform),
+            object_id=xform.pk,
+            data_type=EXPORT_COLUMNS_REGISTER,
+        )
+
+    except MetaData.DoesNotExist:
+        return
+
+    instance_qs = xform.instances.filter(deleted_at__isnull=True)
+
+    for instance in queryset_iterator(instance_qs, chunksize=500):
+        _register_instance_repeat_columns(instance, register)

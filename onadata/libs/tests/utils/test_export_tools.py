@@ -2,6 +2,8 @@
 """
 Test export_tools module
 """
+
+import csv
 import json
 import os
 import shutil
@@ -10,9 +12,11 @@ import zipfile
 from datetime import date, datetime, timedelta
 
 from django.conf import settings
+from django.contrib.contenttypes.models import ContentType
 from django.contrib.sites.models import Site
 from django.core.files.storage import default_storage
 from django.core.files.temp import NamedTemporaryFile
+from django.test import RequestFactory
 from django.test.utils import override_settings
 from django.utils import timezone
 
@@ -24,12 +28,13 @@ from savReaderWriter import SavWriter
 from onadata.apps.api import tests as api_tests
 from onadata.apps.api.tests.viewsets.test_abstract_viewset import TestAbstractViewSet
 from onadata.apps.api.viewsets.data_viewset import DataViewSet
-from onadata.apps.logger.models import Attachment, Instance, XForm
-from onadata.apps.main.tests.test_base import TestBase
-from onadata.apps.viewer.models.export import Export
-from onadata.apps.viewer.models.parsed_instance import query_data
+from onadata.apps.logger.models import Attachment, Entity, EntityList, Instance, XForm
+from onadata.apps.main.models import MetaData
+from onadata.apps.viewer.models.export import Export, GenericExport
+from onadata.apps.viewer.models.parsed_instance import query_fields_data
 from onadata.libs.serializers.merged_xform_serializer import MergedXFormSerializer
 from onadata.libs.serializers.xform_serializer import XFormSerializer
+from onadata.libs.utils.api_export_tools import custom_response_handler
 from onadata.libs.utils.export_builder import (
     ExportBuilder,
     encode_if_str,
@@ -38,10 +43,12 @@ from onadata.libs.utils.export_builder import (
 from onadata.libs.utils.export_tools import (
     check_pending_export,
     generate_attachments_zip_export,
+    generate_entity_list_export,
     generate_export,
     generate_geojson_export,
     generate_kml_export,
     generate_osm_export,
+    get_query_params_from_metadata,
     get_repeat_index_tags,
     kml_export_data,
     parse_request_export_options,
@@ -54,7 +61,7 @@ def _logger_fixture_path(*args):
     return os.path.join(settings.PROJECT_ROOT, "libs", "tests", "fixtures", *args)
 
 
-class TestExportTools(TestBase, TestAbstractViewSet):
+class TestExportTools(TestAbstractViewSet):
     """
     Test export_tools functions.
     """
@@ -101,7 +108,10 @@ class TestExportTools(TestBase, TestAbstractViewSet):
         self._publish_xls_file_and_set_xform(xlsform_path)
         submission_path = os.path.join(osm_fixtures_dir, "instance_a.xml")
         count = Attachment.objects.filter(extension="osm").count()
-        self._make_submission_w_attachment(submission_path, paths)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            # Ensure on commit callbacks are executed
+            self._make_submission_w_attachment(submission_path, paths)
         self.assertTrue(Attachment.objects.filter(extension="osm").count() > count)
 
         options = {"extension": Attachment.OSM}
@@ -253,7 +263,7 @@ class TestExportTools(TestBase, TestAbstractViewSet):
 
         self.assertTrue(will_create_new_export)
 
-    def test_should_not_create_new_export_when_old_exists(self):
+    def test_should_not_create_new_export_fn(self):
         export_type = "csv"
         self._publish_transportation_form_and_submit_instance()
         options = {
@@ -268,6 +278,174 @@ class TestExportTools(TestBase, TestAbstractViewSet):
         )
 
         self.assertFalse(will_create_new_export)
+
+    def test_get_query_params_from_metadata_fn(self):
+        self._publish_transportation_form_and_submit_instance()
+        metadata = MetaData.objects.create(
+            content_type=ContentType.objects.get_for_model(XForm),
+            data_type="media",
+            data_value=f"xform_geojson {self.xform.id} testgeojson2",
+            extra_data={
+                "data_title": "start",
+                "data_fields": "",
+                "data_geo_field": "qn09",
+            },
+            object_id=self.xform.id,
+        )
+        self.assertEqual(
+            {
+                "title": "start",
+                "fields": "",
+                "geo_field": "qn09",
+            },
+            get_query_params_from_metadata(metadata),
+        )
+
+        metadata.extra_data = {
+            "data_title": "start",
+            "data_fields": "one,two",
+            "data_geo_field": "qn09",
+        }
+        self.assertEqual(
+            {
+                "title": "start",
+                "fields": "one,two",
+                "geo_field": "qn09",
+            },
+            get_query_params_from_metadata(metadata),
+        )
+
+        metadata.extra_data = {
+            "data_title": "start",
+            "data_fields": "",
+            "data_geo_field": "qn09",
+            "data_simple_style": True,
+        }
+        self.assertEqual(
+            {"title": "start", "fields": "", "geo_field": "qn09", "simple_style": True},
+            get_query_params_from_metadata(metadata),
+        )
+
+    def test_should_not_create_new_export_when_old_exists(self):
+        export_type = "geojson"
+        self._publish_transportation_form_and_submit_instance()
+
+        request = RequestFactory().get("/")
+        request.user = self.user
+        request.query_params = options = {}
+        metadata = MetaData.objects.create(
+            content_type=ContentType.objects.get_for_model(XForm),
+            data_type="media",
+            data_value=f"xform_geojson {self.xform.id} testgeojson",
+            extra_data={
+                "data_title": "start",
+                "data_fields": "",
+                "data_geo_field": "qn09",
+                "data_simple_style": True,
+            },
+            object_id=self.xform.id,
+        )
+        custom_response_handler(
+            request,
+            self.xform,
+            {},
+            export_type,
+            filename="testgeojson",
+            dataview=False,
+            metadata=metadata,
+        )
+
+        self.assertEqual(1, Export.objects.filter(xform=self.xform).count())
+        self.assertEqual(
+            {
+                "dataview_pk": False,
+                "title": "start",
+                "fields": "",
+                "simple_style": True,
+                "include_hxl": True,
+                "include_images": True,
+                "include_labels": False,
+                "win_excel_utf8": False,
+                "group_delimiter": "/",
+                "include_reviews": False,
+                "remove_group_name": False,
+                "include_labels_only": False,
+                "split_select_multiples": True,
+            },
+            Export.objects.get(xform=self.xform).options,
+        )
+        custom_response_handler(
+            request,
+            self.xform,
+            {},
+            export_type,
+            filename="testgeojson",
+            dataview=False,
+            metadata=metadata,
+        )
+        # we still have only one export, we didn't generate another
+        self.assertEqual(1, Export.objects.filter(xform=self.xform).count())
+        self.assertEqual(
+            {
+                "dataview_pk": False,
+                "title": "start",
+                "fields": "",
+                "simple_style": True,
+                "include_hxl": True,
+                "include_images": True,
+                "include_labels": False,
+                "win_excel_utf8": False,
+                "group_delimiter": "/",
+                "include_reviews": False,
+                "remove_group_name": False,
+                "include_labels_only": False,
+                "split_select_multiples": True,
+            },
+            Export.objects.get(xform=self.xform).options,
+        )
+
+        # New metadata will yield a new export
+        metadata = MetaData.objects.create(
+            content_type=ContentType.objects.get_for_model(XForm),
+            data_type="media",
+            data_value=f"xform_geojson {self.xform.id} testgeojson2",
+            extra_data={
+                "data_title": "end",
+                "data_fields": "",
+                "data_geo_field": "qn09",
+                "data_simple_style": True,
+            },
+            object_id=self.xform.id,
+        )
+        custom_response_handler(
+            request,
+            self.xform,
+            {},
+            export_type,
+            filename="testgeojson2",
+            dataview=False,
+            metadata=metadata,
+        )
+        # we generated a new export since the extra_data has been updated
+        self.assertEqual(2, Export.objects.filter(xform=self.xform).count())
+        self.assertEqual(
+            {
+                "dataview_pk": False,
+                "title": "end",
+                "fields": "",
+                "simple_style": True,
+                "include_hxl": True,
+                "include_images": True,
+                "include_labels": False,
+                "win_excel_utf8": False,
+                "group_delimiter": "/",
+                "include_reviews": False,
+                "remove_group_name": False,
+                "include_labels_only": False,
+                "split_select_multiples": True,
+            },
+            Export.objects.filter(xform=self.xform).last().options,
+        )
 
     def test_should_create_new_export_when_filter_defined(self):
         export_type = "csv"
@@ -321,7 +499,13 @@ class TestExportTools(TestBase, TestAbstractViewSet):
         key = "photo"
         value = "123.jpg"
         val_or_url = get_value_or_attachment_uri(
-            key, value, row, self.xform, media_xpaths, attachment_list
+            key,
+            value,
+            row,
+            self.xform,
+            media_xpaths,
+            attachment_list,
+            host="example.com",
         )
         self.assertTrue(val_or_url)
 
@@ -332,7 +516,13 @@ class TestExportTools(TestBase, TestAbstractViewSet):
         # when include_images is False, you get the value
         media_xpaths = []
         val_or_url = get_value_or_attachment_uri(
-            key, value, row, self.xform, media_xpaths, attachment_list
+            key,
+            value,
+            row,
+            self.xform,
+            media_xpaths,
+            attachment_list,
+            host="example.com",
         )
         self.assertTrue(val_or_url)
         self.assertEqual(value, val_or_url)
@@ -344,7 +534,13 @@ class TestExportTools(TestBase, TestAbstractViewSet):
 
         media_xpaths = ["photo"]
         val_or_url = get_value_or_attachment_uri(
-            key, value, row, self.xform, media_xpaths, attachment_list
+            key,
+            value,
+            row,
+            self.xform,
+            media_xpaths,
+            attachment_list,
+            host="example.com",
         )
         self.assertTrue(val_or_url)
         self.assertEqual(value, val_or_url)
@@ -381,7 +577,13 @@ class TestExportTools(TestBase, TestAbstractViewSet):
         key = "photo"
         value = "1 2 3.jpg"
         val_or_url = get_value_or_attachment_uri(
-            key, value, row, self.xform, media_xpaths, attachment_list
+            key,
+            value,
+            row,
+            self.xform,
+            media_xpaths,
+            attachment_list,
+            host="example.com",
         )
 
         self.assertTrue(val_or_url)
@@ -581,8 +783,9 @@ class TestExportTools(TestBase, TestAbstractViewSet):
         username = self.xform.user.username
         id_string = self.xform.id_string
         # get metadata instance and pass to geojson export util function
-        self.assertEqual(self.xform.metadata_set.count(), 1)
-        metadata = self.xform.metadata_set.all()[0]
+        metadata_qs = self.xform.metadata_set.filter(data_type="media")
+        self.assertEqual(metadata_qs.count(), 1)
+        metadata = metadata_qs[0]
         export = generate_geojson_export(
             export_type, username, id_string, metadata, options=options, xform=xform1
         )
@@ -686,8 +889,9 @@ class TestExportTools(TestBase, TestAbstractViewSet):
         username = self.xform.user.username
         id_string = self.xform.id_string
         # get metadata instance and pass to geojson export util function
-        self.assertEqual(self.xform.metadata_set.count(), 1)
-        metadata = self.xform.metadata_set.all()[0]
+        metadata_qs = self.xform.metadata_set.filter(data_type="media")
+        self.assertEqual(metadata_qs.count(), 1)
+        metadata = metadata_qs[0]
         export = generate_geojson_export(
             export_type, username, id_string, metadata, options=options, xform=xform1
         )
@@ -713,7 +917,7 @@ class TestExportTools(TestBase, TestAbstractViewSet):
                     }
                 ],
             }
-            self.assertEqual(len(geojson['features']), 1)
+            self.assertEqual(len(geojson["features"]), 1)
             content = json.loads(content)
             self.assertEqual(content, geojson)
 
@@ -937,7 +1141,9 @@ class TestExportTools(TestBase, TestAbstractViewSet):
             "query": '{"_submission_time": {"$lte": "2019-01-13T00:00:00"}}',
         }
         filter_query = options.get("query")
-        instance_ids = query_data(self.xform, fields='["_id"]', query=filter_query)
+        instance_ids = query_fields_data(
+            self.xform, fields='["_id"]', query=filter_query
+        )
 
         export = generate_attachments_zip_export(
             Export.ZIP_EXPORT, self.user.username, self.xform.id_string, None, options
@@ -976,3 +1182,63 @@ class TestExportTools(TestBase, TestAbstractViewSet):
         for a in Attachment.objects.all():
             self.assertTrue(os.path.exists(os.path.join(temp_dir, a.media_file.name)))
         shutil.rmtree(temp_dir)
+
+
+class GenerateExportTestCase(TestAbstractViewSet):
+    """Tests for method `generate_export`"""
+
+    def test_generate_export_entity_list(self):
+        """Generate export for EntityList dataset works"""
+        # Publish registration form and create "trees" Entitylist dataset
+        self._publish_registration_form(self.user)
+        entity_list = EntityList.objects.get(name="trees")
+        Entity.objects.create(
+            entity_list=entity_list,
+            json={
+                "species": "purpleheart",
+                "geometry": "-1.286905 36.772845 0 0",
+                "circumference_cm": 300,
+                "label": "300cm purpleheart",
+            },
+            uuid="dbee4c32-a922-451c-9df7-42f40bf78f48",
+        )
+        Entity.objects.create(
+            entity_list=entity_list,
+            json={
+                "species": "purpleheart",
+                "geometry": "-1.286905 36.772845 0 0",
+                "circumference_cm": 300,
+                "label": "300cm purpleheart",
+            },
+            uuid="614bda97-0a46-4d31-9661-736287edf7da",
+            deleted_at=timezone.now(),  # deleted Entity should be ignored
+        )
+
+        export = generate_entity_list_export(entity_list)
+        self.assertIsNotNone(export)
+        self.assertTrue(export.is_successful)
+        self.assertEqual(GenericExport.objects.count(), 1)
+        export = GenericExport.objects.first()
+
+        with open(export.full_filepath, "r") as csv_file:
+            csv_reader = csv.reader(csv_file)
+            header = next(csv_reader)
+            expected_header = [
+                "name",
+                "label",
+                "geometry",
+                "species",
+                "circumference_cm",
+            ]
+            self.assertCountEqual(header, expected_header)
+            # Read all rows into a list
+            rows = list(csv_reader)
+            self.assertEqual(len(rows), 1)
+            expected_row = [
+                "dbee4c32-a922-451c-9df7-42f40bf78f48",
+                "300cm purpleheart",
+                "-1.286905 36.772845 0 0",
+                "purpleheart",
+                "300",
+            ]
+            self.assertCountEqual(rows[0], expected_row)
